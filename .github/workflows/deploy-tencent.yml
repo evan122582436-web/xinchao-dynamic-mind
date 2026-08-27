@@ -1,6 +1,6 @@
 name: Deploy to Tencent CVM
 
-on:
+'on':
   workflow_dispatch:
   push:
     branches: [main]
@@ -38,6 +38,7 @@ jobs:
 
       - name: Check deployment secrets
         id: deploy_config
+        shell: bash
         run: |
           if [ -z "$TENCENT_HOST" ] || [ -z "$TENCENT_USER" ] || [ -z "$TENCENT_SSH_KEY" ]; then
             echo "Tencent deployment secrets are missing; tests passed, deployment skipped."
@@ -48,6 +49,7 @@ jobs:
 
       - name: Configure SSH
         if: steps.deploy_config.outputs.ready == 'true'
+        shell: bash
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$TENCENT_SSH_KEY" > ~/.ssh/tencent_deploy_key
@@ -57,6 +59,7 @@ jobs:
 
       - name: Sync backend source
         if: steps.deploy_config.outputs.ready == 'true'
+        shell: bash
         run: |
           PORT="${TENCENT_PORT:-22}"
           DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-/home/ubuntu/xinchao-nian}"
@@ -69,22 +72,27 @@ jobs:
 
       - name: Rebuild service
         if: steps.deploy_config.outputs.ready == 'true'
+        shell: bash
         run: |
           PORT="${TENCENT_PORT:-22}"
           DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-/home/ubuntu/xinchao-nian}"
-          ssh -i ~/.ssh/tencent_deploy_key -p "$PORT" "$TENCENT_USER@$TENCENT_HOST" "set -e
-            cd '$DEPLOY_PATH'
-            if [ ! -f .env ]; then
-              echo 'Missing .env in deploy path'
-              exit 1
-            fi
-            grep -q '^LOCAL_MEMORY_ENABLED=' .env || cat >> .env <<'EOF'
-
-LOCAL_MEMORY_ENABLED=true
-LOCAL_MEMORY_PATH=/app/state/local-memory.jsonl
-LOCAL_MEMORY_MAX_SUMMARY_CHARS=800
-EOF
-            sudo docker compose up -d --build
-            sudo docker compose ps
-            curl -fsS http://127.0.0.1:18110/health
-          "
+          ssh -i ~/.ssh/tencent_deploy_key -p "$PORT" "$TENCENT_USER@$TENCENT_HOST" 'bash -s' -- "$DEPLOY_PATH" <<'REMOTE'
+          set -e
+          DEPLOY_PATH="$1"
+          cd "$DEPLOY_PATH"
+          if [ ! -f .env ]; then
+            echo 'Missing .env in deploy path'
+            exit 1
+          fi
+          if ! grep -q '^LOCAL_MEMORY_ENABLED=' .env; then
+            {
+              printf '\n'
+              printf '%s\n' 'LOCAL_MEMORY_ENABLED=true'
+              printf '%s\n' 'LOCAL_MEMORY_PATH=/app/state/local-memory.jsonl'
+              printf '%s\n' 'LOCAL_MEMORY_MAX_SUMMARY_CHARS=800'
+            } >> .env
+          fi
+          sudo docker compose up -d --build
+          sudo docker compose ps
+          curl -fsS http://127.0.0.1:18110/health
+          REMOTE
