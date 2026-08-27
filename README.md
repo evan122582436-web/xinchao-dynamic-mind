@@ -1,17 +1,20 @@
-# 心潮动态心智系统 2.4.0
-
-![心潮动态心智系统](docs/cover.png)
+# 心潮·念 3.1
 
 心潮是一个独立、可自托管的 AI 动态状态层。它在对话之外持续维护驱动力、念头池、疲惫、睡眠、梦境余韵与短期窗口状态，并通过 HTTP API 或远程 MCP 接入不同模型、设备和前端。
 
 > 心潮模拟可解释的动态状态，不宣称产生意识、情感或生命。核心状态机可离线运行；模型、长期记忆、OAuth 和通知均为可选适配器。
 
-## 2.4.0 更新重点
+## 3.1 更新重点
 
-- **用户互动连接桥服务端**：新增 `/bridge/v1/*` 耐久队列、SSE 通知、一次性投递读取与严格 ACK。
-- **只供用户互动**：只接受用户主动发出的互动、便签和预约；梦境、思念、内部状态与 AI 自主行动不会自动注入窗口。
-- **独立机器凭据**：Bridge 使用独立于 `SERVICE_TOKEN` 和 Dashboard 口令的机器 Token，默认关闭。
-- **持久、幂等、可恢复**：投递按 `event_id` 去重，离线时继续保存，失败 ACK 不会把消息误标为送达。
+- **Personality Core 性格内核层**：新增与 12 维当下驱力完全分开的月度内核。由 AI 每月自主回顾和评分，人类不参与；私有 JSON 缺失或损坏时自动回到中性。
+- **单向、极慢的基线偏置**：仅爱与依恋、表达、平静与安全、欲望与动机可影响批准的驱力，并硬封顶在 ±10%；系统不会根据驱力反过来更改性格评分。
+- **`pending_from_me` 去留权收回用户**：AI 只能创建待交付内容、在真正说出后回执；只有用户可以选择留下（hold）或放下（drop）。
+- **引用式记忆关联**：念头与梦可围绕具体记忆桶生成，但心潮不按 ID 改写 OB 正文；用户 hold 后仍使用现有 `grow` 落地并保留溯源关系。
+- **饱足期与驱力耦合**：满足后默认保留 2 小时“饱”的平台期，只暂停自然增长；真实事件、记忆共振和输出回流仍然可以穿透。
+
+> 性格内核评分只能由 AI 显式调用受鉴权 MCP 工具完成。心潮不会根据 12 维驱力自动反推人格；月度材料包与低频 OB 记账仍属于后续流程。
+
+## 3.0 基础能力
 
 - **HTTP 便签闭环**：补齐 `POST /v1/handoff-note`，HTTP 前端与 MCP 客户端现在使用同一套有界、幂等的短期交接。
 - **在场时间修复**：heartbeat 和真实 `xinchao_event` 都会刷新 `lastHeartbeatAt`，避免在线时被自主推送误判为长期离线。
@@ -26,6 +29,17 @@
 
 完整差异见 [CHANGELOG.md](CHANGELOG.md)。
 
+## 先分清三个入口
+
+| 入口 | 用途 | 不能拿来做什么 |
+| --- | --- | --- |
+| `https://xinchaomind.uk` | 公共可视化网页；让用户连接自己已经部署好的心潮 | 不是 MCP 服务，也不会替用户运行心潮 |
+| `https://你的心潮域名/mcp` | Claude、ChatGPT 或其他 Agent 的心潮 MCP 连接器 | 不能填写公开网页地址，也不能填写 OB 地址 |
+| `OMBRE_MCP_URL` | 心潮服务端内部连接自己的长期记忆后端 | 不公开给网页，不作为心潮连接器地址 |
+
+一句话记忆：**人打开公开网页，AI 连接心潮 `/mcp`，心潮再从服务端内部连接 OB。**
+如果出现 `Couldn't register`，先检查填入连接器的是不是完整的心潮 `/mcp` 地址，以及心潮是否开启 MCP/OAuth；不要把 `xinchaomind.uk` 或 OB 的地址填进去。
+
 ## 可视化接入地基（开发中）
 
 当前仓库已经把 UI 与状态机拆开，并提供：
@@ -33,8 +47,8 @@
 - 默认脱敏的十二维 Dashboard Snapshot；
 - 不含正文的结构化潮汐时间线；
 - 面向网页 AI、本地 Agent、手机网页与自建后端的接入清单；
-- 独立 Dashboard 口令换取 HttpOnly 只读会话，浏览器无需接触 `SERVICE_TOKEN`；
-- 独立用户互动 Runtime Bridge 协议；网页只提交语义互动，不直接修改心潮数值。
+- 独立 Dashboard 口令换取 HttpOnly 会话，浏览器无需接触 `SERVICE_TOKEN`；状态投影只读，小屋仅开放明确的留言、锁与账本写入；
+- 独立 [`Wake Bridge`](packages/wake-bridge/) 消息信封协议，为梦境余韵、思念内容和自主行动结果预留用户/AI 双通道。
 
 接口、环境变量和前端示例见 [可视化与多终端接入地基](docs/DASHBOARD-INTEGRATION.md)。视觉主题、花瓣与梦境星云可以独立迭代，不需要重写服务端。
 
@@ -62,6 +76,9 @@
 - 可选 Ombre-compatible 长期记忆 MCP。
 - 可选 Bark 通知与跨类型去重。
 - 原子状态持久化与结构化转换日志。
+- 可选的月度 Personality Core 私有状态；与 12 维驱力分开存储、分开计算、分开展示。
+
+Personality Core 的数据属于部署者，不应提交到公开仓库。格式、单向偏置与隐私边界见 [Personality Core 接入说明](docs/PERSONALITY-CORE.md)。
 
 ## 快速开始
 
@@ -118,6 +135,11 @@ https://xinchao.example.com/mcp
 | `xinchao_context` | 获取当前动态短态和近期连续性；同一窗口首次启动默认只交付一次 |
 | `xinchao_event` | 回传一次明确互动及有界窗口状态；`event_id` 用于幂等 |
 | `xinchao_handoff_note` | 保存限时近期进度摘要，不保存整段聊天原文 |
+| `xinchao_cabin_inbox` | 读取用户明确开锁的小屋来信；上锁正文永不返回 |
+| `xinchao_cabin_note` | AI 主动给用户的小屋留一封信或便签 |
+| `xinchao_pending_create` | AI 在独处时创建一条想等用户回来再说的内容 |
+| `xinchao_pending_consumed` | AI 在确实说出后回执；不代表替用户选择留下或放下 |
+| `xinchao_personality_reflect` | AI 每月自主完成一次完整 14 维内核评分；人类不参与，同月不可覆盖 |
 
 `session_id` 是可选覆盖值。正常情况下服务端会使用 MCP 连接自带的稳定窗口 ID。
 
@@ -143,31 +165,52 @@ Authorization: Bearer <SERVICE_TOKEN>
 | `POST` | `/v1/drive-feedback` | 管理端受控反馈接口 |
 | `GET` | `/v1/dashboard/snapshot` | 默认脱敏的可视化状态投影 |
 | `GET` | `/v1/dashboard/timeline` | 结构化变化时间线（无正文） |
+| `GET` | `/v1/dashboard/memory-map` | 从自己的 OB 读取脱敏记忆星图元数据 |
 | `GET` | `/v1/dashboard/connect` | 多端接入能力清单（无凭据） |
 | `POST` | `/mcp` | Streamable HTTP MCP |
 
-## 用户互动连接桥
+### 私密小屋接口
 
-连接桥是可选能力，但前提是先部署好心潮。它只将用户主动发出的互动、便签与预约交给用户指定的 AI Runtime；不会自动投递梦境、思念、心潮数值或 AI 的自主内容。
-
-启用服务端队列：
-
-```env
-BRIDGE_ENABLED=true
-BRIDGE_MACHINE_TOKEN=独立随机口令（至少32字符）
-BRIDGE_STATE_PATH=/app/state/bridge-queue.json
-```
-
-机器接口均要求 `Authorization: Bearer <BRIDGE_MACHINE_TOKEN>`：
+小屋数据单独写入 `CABIN_STATE_PATH`（默认 `/app/state/cabin.json`），只保存用户或 AI
+明确提交的来信和账本记录，不保存聊天原文、提示词或密钥。网页使用 Dashboard 的
+HttpOnly 会话访问：
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
-| `GET` | `/bridge/v1/health` | 协议与健康检查 |
-| `GET` | `/bridge/v1/events` | SSE，只通知到期的 `deliveryId` |
-| `GET` | `/bridge/v1/deliveries/:id` | 读取一次待投递用户互动 |
-| `POST` | `/bridge/v1/deliveries/:id/ack` | 回传 `delivered` 或 `retryable_failed` |
+| `GET` | `/dashboard/api/cabin` | 读取来信、未读数量、账本与汇总 |
+| `GET` | `/dashboard/api/snapshot` | 读取花瓣、状态与可选的真实一句话 |
+| `GET` | `/dashboard/api/memory-map` | 从这位用户自己的 OB 读取记忆星图元数据 |
+| `GET` | `/dashboard/api/personality` | 读取 AI 月度性格内核与历史快照 |
+| `GET` / `PATCH` | `/dashboard/api/pending` | 读取待交付内容；由用户选择 hold 或 drop |
+| `POST` / `PATCH` | `/dashboard/api/cabin/note` | 留信、标为已读、上锁或开锁 |
+| `POST` / `PATCH` / `DELETE` | `/dashboard/api/cabin/ledger` | 新增、编辑或删除账本记录 |
 
-Dashboard 会话可通过 `POST /dashboard/api/bridge/deliveries` 创建用户便签或预约。机器 Token 不得写入浏览器、URL、日志或公开仓库。客户端见独立项目 [xinchao-runtime-bridge](https://github.com/tianyupaipai-cmd/xinchao-runtime-bridge)。
+用户来信默认上锁：连接桥只会通知 AI“有一封信”，不会携带正文。用户主动开锁后，
+AI 才能通过 `xinchao_cabin_inbox` 读取。重新上锁只会阻止之后的读取，无法撤回 AI
+已经读过的内容。
+
+花瓣旁的“一句话”只取自当前心潮自己的思绪池，不使用演示文案，也不会由网页猜测。
+考虑到它与梦境正文都可能包含私密内容，默认不会返回；自托管者明确设置
+`DASHBOARD_INCLUDE_PRIVATE_TEXT=true` 后，才会通过已鉴权的 Dashboard 会话展示。
+
+## Personality Core 私有状态
+
+这一层的真实分数和原因属于部署实例，不属于公开源码。AI 通过受鉴权 MCP 工具按月写入私有状态：
+
+```env
+PERSONALITY_PATH=/app/state/personality.json
+# 可选，仅用于网页展示；不参与驱力计算
+PERSONALITY_ZODIAC=双子座
+```
+
+- `personality.json` 应放在部署侧的 state 卷中，不应提交至 Git。
+- 文件不存在、格式损坏或未配置时，所有偏置都为 `1.0`，心潮仍可正常运行。
+- 人类不参与评分；AI 每月调用一次 `xinchao_personality_reflect`，同月重试不会覆盖既有快照。
+- 性格内核只能单向、低频地影响驱力基线；代码中没有从 12 维 `state.json` 自动反写内核的路径。
+- 已鉴权的 `/dashboard/api/snapshot` 会同时返回 `personality`，供网页的“星核”视图直接点亮；缺失分值按中性 `70` 投影。
+- `reason` 默认不进入快照，只有部署者明确设置 `DASHBOARD_INCLUDE_PRIVATE_TEXT=true` 才返回。
+
+完整 14 维、AI 月度自评流程、四类允许映射和 ±10% 封顶公式见 [Personality Core 接入说明](docs/PERSONALITY-CORE.md)。
 
 ## 心跳接入档位
 
@@ -206,54 +249,38 @@ Claude Code 可使用仓库中的 [`scripts/xinchao-heartbeat-hook.sh`](scripts/
 
 token 文件应放在仓库外并设为 `0600`；私有设置不要提交。均衡档将最小间隔改成 `120` 或 `300`。
 
-## 浏览器直连（没有公网地址时）
-
-网页前端默认由**服务端**代访问你的心潮，所以你的心潮必须有一个公网 HTTPS
-地址。如果你的心潮跑在自己电脑或手机上，别人的服务器永远到不了你的
-`127.0.0.1` —— 这不是配置问题，是做不到。
-
-如果**浏览器和心潮在同一台机器上**，可以改为让浏览器直接读，不经过任何
-中间服务器：
-
-```env
-DASHBOARD_ENABLED=true
-DASHBOARD_ACCESS_TOKEN=
-DASHBOARD_ALLOWED_ORIGINS=https://前端地址
-```
-
-- 默认为空 = 不放行任何跨源请求。不填时行为与不支持直连时完全一致。
-- 只填你自己确实要用的前端地址，逗号分隔多个。
-- 前端用 `POST /dashboard/session` 带 `{"mode":"header"}` 换一个只读会话
-  token，之后所有请求用 `Authorization: Bearer <token>`。
-
-**限制**：
-
-- 只在浏览器与心潮同机时有效。同一局域网的另一台设备**不行** —— 内网 IP
-  不是浏览器认可的可信来源，会被混合内容拦截。
-- Safari 对 `http://localhost` 的策略比 Chrome/Firefox 严，可能仍被拦。
-- 直连模式下会话 token 由浏览器持有，比同源的 HttpOnly Cookie 弱；
-  换来的是数据不经过第三方服务器。**任何情况下都不要把 `SERVICE_TOKEN`
-  交给前端**，它能读原始状态和完整 MCP。
-
 ## 长期记忆边界
 
-长期记忆不是心潮的必需组件。启用外部记忆时：
+心潮自带一份本地小家记忆库，默认写入 Docker state volume：
+
+```env
+LOCAL_MEMORY_ENABLED=true
+LOCAL_MEMORY_PATH=/app/state/local-memory.jsonl
+LOCAL_MEMORY_MAX_SUMMARY_CHARS=800
+```
+
+`xinchao_event` 带 `context_summary` 时会优先沉淀到本地记忆库；`xinchao_memory_recent`、
+`xinchao_memory_search`、`xinchao_memory_write`、`xinchao_memory_forget` 读写的也是这份主记忆。
+外部 OB 现在只作为可选备份/旧数据参考，不再是心潮自动沉淀的唯一落点。启用外部记忆时：
 
 ```env
 OMBRE_MCP_URL=https://memory.example.com/mcp
 OMBRE_MCP_TOKEN=
 OMBRE_READ_ENABLED=false
 OMBRE_WRITE_ENABLED=false
+# 可选：显式设 false 可关闭互动事件自动沉淀；未设置时跟随 OMBRE_WRITE_ENABLED。
+# OMBRE_EVENT_WRITE_ENABLED=false
 CONTEXT_OMBRE_ENABLED=false
 ```
 
-- 只要开启 `OMBRE_READ_ENABLED`、`OMBRE_WRITE_ENABLED` 或
+- 只要开启 `OMBRE_READ_ENABLED`、`OMBRE_WRITE_ENABLED`、`OMBRE_EVENT_WRITE_ENABLED` 或
   `CONTEXT_OMBRE_ENABLED`，`OMBRE_MCP_URL` 与 `OMBRE_MCP_TOKEN` 就都必须填写；
   缺少任一项时服务会拒绝启动，避免在后台持续产生 401。
 - `OMBRE_MCP_TOKEN` 是外部记忆 MCP 接受的服务端 Bearer 凭据，不是 Dashboard
   登录密码。它只能放在心潮服务端 `.env`，不能写入前端、URL 或 Git 仓库。
 - 心潮只请求近期连续性，不用短 handoff 替代客户端的稳定核心资料。
-- 自动梦境写入会明确标记为自动来源。
+- 自动梦境写入和互动事件自动沉淀都会明确标记为自动来源。
+- 互动事件只沉淀语义摘要、窗口语气和受影响维度，不保存聊天原文。
 - 技术日志、密钥、OAuth 状态和聊天原文不应进入长期人物记忆。
 - 所有外部读写默认关闭，按最小权限逐项启用。
 
@@ -274,7 +301,7 @@ CONTEXT_OMBRE_ENABLED=false
 npm test
 ```
 
-当前测试覆盖状态结算、睡眠与醒来、念头池、窗口隔离、幂等互动、Context Envelope、交接便签、OAuth、MCP 协议、外部记忆适配、通知去重和隐私审计。
+当前测试覆盖状态结算、睡眠与醒来、念头池、窗口隔离、幂等互动、Context Envelope、交接便签、OAuth、MCP 协议、外部记忆适配、pending 双轴状态、饱足期、驱力耦合、Personality Core 单向偏置、通知去重和隐私审计。
 
 ## 项目结构
 
@@ -283,7 +310,7 @@ src/             状态机、MCP、OAuth、Dashboard 投影与可选适配器
 test/            Node.js 原生测试
 configs/         可替换提示词
 scripts/         本地配置、部署与烟雾测试
-packages/        可独立使用的有界消息信封协议
+packages/        可独立使用的 Wake Bridge 消息协议
 state/           运行状态挂载目录（不提交真实数据）
 memory-data/     可选外部心跳挂载目录
 ```

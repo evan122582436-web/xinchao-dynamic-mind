@@ -1,0 +1,83 @@
+name: Deploy to Tencent CVM
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'configs/**'
+      - 'package.json'
+      - 'Dockerfile'
+      - 'compose.yaml'
+      - '.env.example'
+      - '.github/workflows/deploy-tencent.yml'
+
+concurrency:
+  group: tencent-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      TENCENT_HOST: ${{ secrets.TENCENT_HOST }}
+      TENCENT_USER: ${{ secrets.TENCENT_USER }}
+      TENCENT_SSH_KEY: ${{ secrets.TENCENT_SSH_KEY }}
+      TENCENT_PORT: ${{ secrets.TENCENT_PORT }}
+      TENCENT_DEPLOY_PATH: ${{ secrets.TENCENT_DEPLOY_PATH }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run tests
+        run: node --test
+
+      - name: Check deployment secrets
+        run: |
+          test -n "$TENCENT_HOST" || (echo "Missing TENCENT_HOST" && exit 1)
+          test -n "$TENCENT_USER" || (echo "Missing TENCENT_USER" && exit 1)
+          test -n "$TENCENT_SSH_KEY" || (echo "Missing TENCENT_SSH_KEY" && exit 1)
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$TENCENT_SSH_KEY" > ~/.ssh/tencent_deploy_key
+          chmod 600 ~/.ssh/tencent_deploy_key
+          PORT="${TENCENT_PORT:-22}"
+          ssh-keyscan -p "$PORT" -H "$TENCENT_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync backend source
+        run: |
+          PORT="${TENCENT_PORT:-22}"
+          DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-/home/ubuntu/xinchao-nian}"
+          ssh -i ~/.ssh/tencent_deploy_key -p "$PORT" "$TENCENT_USER@$TENCENT_HOST" "mkdir -p '$DEPLOY_PATH/xinchao'"
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            -e "ssh -i ~/.ssh/tencent_deploy_key -p $PORT" \
+            ./ "$TENCENT_USER@$TENCENT_HOST:$DEPLOY_PATH/xinchao/"
+
+      - name: Rebuild service
+        run: |
+          PORT="${TENCENT_PORT:-22}"
+          DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-/home/ubuntu/xinchao-nian}"
+          ssh -i ~/.ssh/tencent_deploy_key -p "$PORT" "$TENCENT_USER@$TENCENT_HOST" "set -e
+            cd '$DEPLOY_PATH'
+            if [ ! -f .env ]; then
+              echo 'Missing .env in deploy path'
+              exit 1
+            fi
+            grep -q '^LOCAL_MEMORY_ENABLED=' .env || cat >> .env <<'EOF'
+
+LOCAL_MEMORY_ENABLED=true
+LOCAL_MEMORY_PATH=/app/state/local-memory.jsonl
+LOCAL_MEMORY_MAX_SUMMARY_CHARS=800
+EOF
+            sudo docker compose up -d --build
+            sudo docker compose ps
+            curl -fsS http://127.0.0.1:18110/health
+          "

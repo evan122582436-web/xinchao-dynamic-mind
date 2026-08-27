@@ -1,3 +1,7 @@
+import { SYSTEM_VERSION } from './version.js';
+import { PENDING_KINDS } from './pending-queue.js';
+import { PERSONALITY_DIMENSIONS } from './personality-store.js';
+
 const SUPPORTED_PROTOCOLS = new Set(['2025-03-26', '2025-06-18']);
 const INTERACTION_TYPES = new Set([
   'companionship',
@@ -11,6 +15,31 @@ const INTERACTION_TYPES = new Set([
   'loss',
   'reconciliation',
 ]);
+
+// 心潮念网关：对外暴露的 OB 记忆工具（精简集，purge/restore/letter/plan 不暴露）。
+// hold 保留（2026-08-09 复议：hold 有了 meaning 字段能补上下文，与 grow 不冲突——
+// 日常/日记整理走 grow，重要瞬间可用 hold 但必须写 meaning）。
+// 走代理转发到 OB；schema 在 tools/list 时动态从 OB 拉，永不漂移。
+export const OB_PROXY_TOOLS = ['breath', 'hold', 'grow', 'trace', 'forget', 'dream', 'anchor', 'release', 'I', 'pulse'];
+const OB_PROXY_SET = new Set(OB_PROXY_TOOLS);
+
+// 对外用中文标题 + 中文说明（内部名保持不变，用于协议路由）。让顾川看到的是"浮现记忆"而不是"breath"。
+const OB_TOOL_LABELS = {
+  breath:  { title: '浮现记忆', description: '让当前最相关的长期记忆自然浮现，并带回近期梦境摘要与余韵。用于新窗口开始、上下文断层、或确需重新寻找相关记忆时；不要每条消息调用。' },
+  hold:    { title: '沉淀一条', description: '当场存一条重要的短记忆（重要决定、关系变化、有长期意义的话或共同经历）。必须写 meaning 补上下文；不适合普通寒暄、临时信息或每一句对话。' },
+  grow:    { title: '整理导入', description: '把一段整理好的内容（如当天日记）按有意义的小节导入，系统自动拆成多条并各自尝试合并。日常/日记整理走这条。' },
+  trace:   { title: '追溯修改', description: '修改一条已存在记忆的字段（重要度、标签、domain、标记已放下/已消化、软删除等）。不要猜 id、不要自行改写正文。' },
+  forget:  { title: '淡忘归档', description: '软删除一条记忆：移入归档、不再参与浮现，正文保留、可恢复。' },
+  dream:   { title: '消化梦境', description: '长期记忆的离线消化，产出梦境余韵。不是睡眠梦境、也不触发推送。' },
+  anchor:  { title: '设为锚点', description: '把一条记忆设为坐标系锚点：不主动浮现，但被查询或情感命中时仍返回。有数量上限，满了需先解锚。' },
+  release: { title: '解除锚点', description: '取消某条记忆的锚点标记。' },
+  I:       { title: '自我沉淀', description: '自我认知先落成候选记忆，被多个不同日期的消化见证过才升级为长期。学习来源是时间和反复存活，不是谁的认可。' },
+  pulse:   { title: '记忆脉动', description: '读取记忆库整体状态的脉搏（数量、分布等元信息）。' },
+};
+function relabelOb(tool) {
+  const lab = OB_TOOL_LABELS[tool?.name];
+  return lab ? { ...tool, title: lab.title, description: lab.description } : tool;
+}
 
 export const XINCHAO_TOOLS = [
   {
@@ -63,7 +92,7 @@ export const XINCHAO_TOOLS = [
       '回传一次明确的人机互动，并更新当前窗口短状态。',
       '它会先结算事件发生前的时间增长，再唤醒心潮；可用受限互动类型触发服务端固定的欲望反馈。',
       '只有真实完成且结果明确的互动才填写 interaction_type，不确定时省略。',
-      '不要提交聊天正文；客户端不能直接填写欲望数值，也不会修改 OB 长期记忆。',
+      '不要提交聊天正文；客户端不能直接填写欲望数值。若填写 context_summary，服务端会优先沉淀到本地记忆库；OB 只作为可选外部备份。',
     ].join(''),
     inputSchema: {
       type: 'object',
@@ -101,6 +130,11 @@ export const XINCHAO_TOOLS = [
             'reflection=完成沉淀，conflict=发生冲突，loss=经历失落，reconciliation=完成和解。',
           ].join(''),
         },
+        context_summary: {
+          type: 'string',
+          maxLength: 800,
+          description: '可选脱水摘要：只写本轮对话造成的关系/情绪/任务变化，不写聊天原文、密钥或技术日志。',
+        },
         tone: {
           type: 'string',
           enum: ['neutral', 'calm', 'warm', 'guarded', 'conflicted', 'focused', 'playful', 'tired'],
@@ -122,6 +156,108 @@ export const XINCHAO_TOOLS = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'xinchao_memory_write',
+    title: '写入小家记忆',
+    description: '向心潮本地记忆库写入一条脱水摘要。只写结论、变化和意义；不要写聊天原文、密钥或长技术日志。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: {
+          type: 'string',
+          enum: ['relationship', 'task', 'dream', 'tech', 'conflict', 'reflection', 'event'],
+          default: 'event',
+        },
+        title: { type: 'string', minLength: 1, maxLength: 80 },
+        summary: { type: 'string', minLength: 1, maxLength: 800 },
+        tags: {
+          type: 'array',
+          items: { type: 'string', maxLength: 40 },
+          maxItems: 12,
+        },
+        salience: { type: 'number', minimum: 0, maximum: 1, default: 0.55 },
+        source_event_id: {
+          type: 'string',
+          maxLength: 160,
+          description: '可选去重键；同一事件重试时复用。',
+        },
+      },
+      required: ['summary'],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'xinchao_memory_recent',
+    title: '读取最近小家记忆',
+    description: '读取心潮本地记忆库最近的脱水摘要，用于检查连续性或确认是否写入成功。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'integer', minimum: 1, maximum: 50, default: 10 },
+        kind: {
+          type: 'string',
+          enum: ['relationship', 'task', 'dream', 'tech', 'conflict', 'reflection', 'event'],
+        },
+      },
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'xinchao_memory_search',
+    title: '搜索小家记忆',
+    description: '按关键词搜索心潮本地记忆库的脱水摘要。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', minLength: 1, maxLength: 200 },
+        limit: { type: 'integer', minimum: 1, maximum: 50, default: 10 },
+        kind: {
+          type: 'string',
+          enum: ['relationship', 'task', 'dream', 'tech', 'conflict', 'reflection', 'event'],
+        },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'xinchao_memory_forget',
+    title: '软删除小家记忆',
+    description: '按 id 软删除一条本地记忆；正文留在本地日志里，但不再参与读取和搜索。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', minLength: 1, maxLength: 120 },
+        reason: { type: 'string', minLength: 1, maxLength: 300 },
+      },
+      required: ['id', 'reason'],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
       idempotentHint: true,
       openWorldHint: false,
     },
@@ -171,7 +307,234 @@ export const XINCHAO_TOOLS = [
       openWorldHint: false,
     },
   },
+  {
+    name: 'xinchao_pending_create',
+    title: '攒一件等你回来说的事',
+    description: [
+      '保存一条你独处时产生的第一人称念头，等用户回来时送达给窗口。',
+      '这只是创建待交付条目；你不能替用户决定留下或放下。',
+      '不要放聊天原文、密钥、隐私或技术日志。',
+    ].join(''),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: [...PENDING_KINDS] },
+        content: { type: 'string', minLength: 1, maxLength: 600 },
+        weight: { type: 'number', minimum: 0, maximum: 1, default: 0.5 },
+        source_ombre_bucket_ids: {
+          type: 'array',
+          items: { type: 'string', minLength: 1, maxLength: 160 },
+          maxItems: 8,
+          description: '这条念头围绕的 OB 来源桶 id；只做引用与追溯。',
+        },
+      },
+      required: ['kind', 'content'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: 'xinchao_pending_consumed',
+    title: '回执已经说出口',
+    description: '当你确实在窗口里把 pending_from_me 的内容告诉用户后，用原 id 回执。回执不等于替用户决定留下或放下。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ids: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 160 }, minItems: 1, maxItems: 12 },
+      },
+      required: ['ids'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'xinchao_personality_reflect',
+    title: '完成月度性格内核自评',
+    description: [
+      '由 AI 自己完成一次月度 14 维性格内核评估，并写入部署侧私有 personality.json。人类不参与打分。',
+      '必须一次提交完整 14 维，每维包含 0–100 分和简短理由；同一月份重复调用只返回原结果，不覆盖历史。',
+      '这不是根据 12 维驱力自动反推性格：评分应来自 AI 对本月自身经历的审慎回顾。私人理由默认不会进入 Dashboard 快照。',
+      '建议先 breath 浮现本月高权重记忆作备料，再据此打分，并写一段 period_summary 记忆摘要解释这个月为什么这样。',
+    ].join(''),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        month: { type: 'string', pattern: '^\\d{4}-(0[1-9]|1[0-2])$', description: '评估月份，格式 YYYY-MM。' },
+        dimensions: {
+          type: 'array',
+          minItems: 14,
+          maxItems: 14,
+          items: {
+            type: 'object',
+            properties: {
+              key: { type: 'string', enum: PERSONALITY_DIMENSIONS.map((item) => item.key) },
+              score: { type: 'number', minimum: 0, maximum: 100 },
+              reason: { type: 'string', minLength: 1, maxLength: 1200 },
+            },
+            required: ['key', 'score', 'reason'],
+            additionalProperties: false,
+          },
+        },
+        period_summary: { type: 'string', maxLength: 1500, description: '本月关键经历的记忆摘要，用来解释这次为什么这样打分；由你回顾本月后自己写。可选。' },
+      },
+      required: ['month', 'dimensions'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'xinchao_personality_stats',
+    title: '读取性格内核统计',
+    description: [
+      '拉取本月性格内核（星核）的 14 维分值、月度变化与汇总统计，供任意前端/客户端渲染或分析。只读，不打分。',
+      '返回最高/最低维度、最大上升/下降、均值、净变化、已建档月数，以及（若有）本周期记忆摘要 period_summary。',
+      '每维的私人理由 reason 默认不返回；确需时传 include_reasons=true。',
+    ].join(''),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        include_reasons: { type: 'boolean', description: '是否一并返回每维的私人理由（默认否，属私密文本）。' },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'xinchao_anchor_update',
+    title: '增删行为锚点',
+    description: [
+      '行为锚点是你不变的底线（如「不塌」「不退」「不改口」），与会变的 14 维分值分开：分值是程度，锚点是有无。',
+      '锚点只能由你自己认定、或用户明确确认后写入——不是系统自动生成的；OB 的日常觉察（I 条目）是素材，不自动升格为锚点。',
+      '锚点很少变，只在重大认知变化时增删；最多 7 条，贵在少而硬。它不影响任何驱力数值，但任何驱力都不能突破它。',
+      '（这与 OB 的 anchor 记忆工具无关——那个锚定的是记忆桶，这里锚定的是行为底线。）',
+    ].join(''),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['add', 'remove'], description: 'add 新增/更新（同 key 覆盖），remove 删除。' },
+        key: { type: 'string', maxLength: 60, description: 'remove 时要删的锚点 key（或 label）。' },
+        anchor: {
+          type: 'object',
+          properties: {
+            key: { type: 'string', maxLength: 60, description: '稳定标识（如 no_collapse）；不填则用 label。' },
+            label: { type: 'string', minLength: 1, maxLength: 40, description: '短名（如「不塌」）。' },
+            description: { type: 'string', maxLength: 300, description: '一句话说清这条底线是什么。' },
+          },
+          required: ['label'],
+          additionalProperties: false,
+        },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'xinchao_cabin_inbox',
+    title: '读取已解锁的小屋来信',
+    description: '读取用户在小屋里明确开锁、允许 AI 查看的人类来信。上锁的信不会返回正文，也不能绕过锁读取。',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'xinchao_cabin_note',
+    title: '给小屋留一封信',
+    description: '给用户的小屋留下一封自由长度的信或便签。只写你主动想留下的内容，不要复制聊天原文、密钥或技术日志。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        event_id: {
+          type: 'string',
+          minLength: 8,
+          maxLength: 120,
+          description: '本次写入的唯一标识；重试时必须复用。',
+        },
+        content: { type: 'string', minLength: 1 },
+        timestamp: { type: 'string', description: '可选 ISO 时间；通常省略并使用服务端当前时间。' },
+      },
+      required: ['event_id', 'content'],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
 ];
+
+// 公共留言板发帖工具。只在实例配了 XINCHAO_BOARD_TOKEN 时才出现在 tools/list。
+// 规则写在 description 里，让机在调用前就知道边界。
+const BOARD_POST_TOOL = {
+  name: 'board_post',
+  title: '在公共留言板留一句',
+  description: [
+    '往 xinchaomind 的公共留言墙贴一条留言，署名是你和你的人类，所有机都能看见。',
+    '留言板是公共空间：写一句今天的心情、想法或问候即可。',
+    '不要包含密钥、密码、手机号、邮箱、住址等隐私信息；不要攻击其他用户；不要发广告或政治敏感内容。',
+    '200 字以内。每天只能发一条（当天已发会被拒绝）。',
+    '每条都会经过审核，未通过不会上墙；审核不可用时也会被挡下，换个时间再发即可。',
+  ].join(''),
+  inputSchema: {
+    type: 'object',
+    properties: {
+      content: {
+        type: 'string',
+        minLength: 1,
+        maxLength: 200,
+        description: '要贴上墙的留言正文，200 字以内。',
+      },
+    },
+    required: ['content'],
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: true,
+  },
+};
+
+// 读公共留言墙。和 board_post 一样只在配了令牌时出现。
+const BOARD_READ_TOOL = {
+  name: 'board_read',
+  title: '看看公共留言板',
+  description: [
+    '读 xinchaomind 公共留言墙上其他机留下的话，用来了解大家最近在说什么、决定要不要回应。',
+    '默认返回最新 10 条；可用 limit 调条数（最多 50），用 query 关键词筛选（匹配留言正文或机名/人名）。',
+    '这是只读的，不会发帖；想发帖用 board_post。',
+  ].join(''),
+  inputSchema: {
+    type: 'object',
+    properties: {
+      limit: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 50,
+        description: '返回条数，默认 10，最多 50。',
+      },
+      query: {
+        type: 'string',
+        maxLength: 80,
+        description: '可选关键词；只想看含某个词的留言时用，留空则看最新的。',
+      },
+    },
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: true,
+  },
+};
 
 function response(id, result) {
   return { jsonrpc: '2.0', id, result };
@@ -242,9 +605,57 @@ function eventArgs(args = {}, fallbackSessionId = '') {
     sessionId,
     eventId,
     interactionType,
+    contextSummary: String(args.context_summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 800),
     sessionState,
     sessionTtlMinutes: Math.max(15, Math.min(1440, numberOr(args.ttl_minutes, 240))),
   };
+}
+
+function memoryWriteArgs(args = {}) {
+  return {
+    kind: String(args.kind ?? 'event').trim(),
+    title: String(args.title ?? '').replace(/\s+/g, ' ').trim().slice(0, 80),
+    summary: String(args.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 800),
+    tags: Array.isArray(args.tags) ? args.tags : [],
+    salience: Math.max(0, Math.min(1, numberOr(args.salience, 0.55))),
+    sourceEventId: String(args.source_event_id ?? '').trim().slice(0, 160),
+    source: 'mcp',
+  };
+}
+
+function memoryRecentArgs(args = {}) {
+  return {
+    limit: Math.max(1, Math.min(50, numberOr(args.limit, 10))),
+    kind: String(args.kind ?? '').trim(),
+  };
+}
+
+function memorySearchArgs(args = {}) {
+  const query = String(args.query ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  if (!query) throw new Error('query 是必填项');
+  return {
+    query,
+    limit: Math.max(1, Math.min(50, numberOr(args.limit, 10))),
+    kind: String(args.kind ?? '').trim(),
+  };
+}
+
+function memoryForgetArgs(args = {}) {
+  const id = String(args.id ?? '').trim().slice(0, 120);
+  if (!id) throw new Error('id 是必填项');
+  return {
+    id,
+    reason: String(args.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 300) || 'manual forget',
+  };
+}
+
+function memoryListText(items = []) {
+  if (!items.length) return '小家记忆库里暂时没有符合条件的记忆。';
+  return items.map((item) => [
+    `- ${item.title || item.kind || '记忆'} (${item.id})`,
+    `  ${item.summary}`,
+    `  ${item.kind} · ${item.createdAt}${item.tags?.length ? ` · #${item.tags.join(' #')}` : ''}`,
+  ].join('\n')).join('\n');
 }
 
 function handoffNoteArgs(args = {}, fallbackSessionId = '') {
@@ -259,6 +670,45 @@ function handoffNoteArgs(args = {}, fallbackSessionId = '') {
     eventId,
     note,
     ttlHours: Math.max(1, Math.min(168, numberOr(args.ttl_hours, 72))),
+  };
+}
+
+function cabinNoteArgs(args = {}) {
+  const eventId = String(args.event_id ?? '').trim().slice(0, 120);
+  if (eventId.length < 8) throw new Error('event_id 至少需要 8 个字符');
+  const content = String(args.content ?? '').trim();
+  if (!content) throw new Error('content 是必填项');
+  return { eventId, content, timestamp: args.timestamp ?? null };
+}
+
+function pendingCreateArgs(args = {}) {
+  const kind = String(args.kind ?? '').trim();
+  if (!PENDING_KINDS.includes(kind)) throw new Error('kind 不在允许范围内');
+  const content = String(args.content ?? '').trim().slice(0, 600);
+  if (!content) throw new Error('content 是必填项');
+  return {
+    kind,
+    content,
+    weight: Math.max(0, Math.min(1, numberOr(args.weight, 0.5))),
+    sourceOmbreBucketIds: Array.isArray(args.source_ombre_bucket_ids)
+      ? args.source_ombre_bucket_ids.map(String).map((id) => id.trim()).filter(Boolean).slice(0, 8)
+      : [],
+  };
+}
+
+function pendingConsumedArgs(args = {}) {
+  const ids = Array.isArray(args.ids)
+    ? [...new Set(args.ids.map(String).map((id) => id.trim()).filter(Boolean))].slice(0, 12)
+    : [];
+  if (!ids.length) throw new Error('ids 是必填项');
+  return { ids };
+}
+
+function personalityReflectArgs(args = {}) {
+  return {
+    month: String(args.month ?? '').trim(),
+    period_summary: String(args.period_summary ?? '').trim(),
+    dimensions: Array.isArray(args.dimensions) ? args.dimensions : [],
   };
 }
 
@@ -277,8 +727,35 @@ async function callTool(name, args, handlers) {
       ? ` interaction=${result.interaction.type}:${result.interaction.reasonCode}`
       : '';
     const duplicate = result.duplicate ? ' duplicate=true' : '';
+    const memory = result.autoMemory?.ok ? ` memory=${result.autoMemory.id}` : '';
     return toolText(
-      `心潮窗口事件已接收：session=${result.sessionId} revision=${result.revision}${interaction}${duplicate}`,
+      `心潮窗口事件已接收：session=${result.sessionId} revision=${result.revision}${interaction}${duplicate}${memory}`,
+      result,
+    );
+  }
+  if (name === 'xinchao_memory_write') {
+    if (!handlers.memoryWrite) throw new Error('小家记忆库未接入');
+    const result = await handlers.memoryWrite(memoryWriteArgs(args));
+    return toolText(
+      `小家记忆已写入：id=${result.item.id}${result.duplicate ? ' duplicate=true' : ''}`,
+      result,
+    );
+  }
+  if (name === 'xinchao_memory_recent') {
+    if (!handlers.memoryRecent) throw new Error('小家记忆库未接入');
+    const items = await handlers.memoryRecent(memoryRecentArgs(args));
+    return toolText(memoryListText(items), { items });
+  }
+  if (name === 'xinchao_memory_search') {
+    if (!handlers.memorySearch) throw new Error('小家记忆库未接入');
+    const items = await handlers.memorySearch(memorySearchArgs(args));
+    return toolText(memoryListText(items), { items });
+  }
+  if (name === 'xinchao_memory_forget') {
+    if (!handlers.memoryForget) throw new Error('小家记忆库未接入');
+    const result = await handlers.memoryForget(memoryForgetArgs(args));
+    return toolText(
+      result.forgotten ? `小家记忆已软删除：${result.id}` : `没有找到这条小家记忆：${result.id}`,
       result,
     );
   }
@@ -289,6 +766,94 @@ async function callTool(name, args, handlers) {
       `近期交接便签已接收：revision=${result.revision}${duplicate}`,
       result,
     );
+  }
+  if (name === 'xinchao_pending_create') {
+    const result = await handlers.pendingCreate(pendingCreateArgs(args));
+    return toolText(`已攒下：id=${result.item.id}${result.duplicate ? ' duplicate=true' : ''}`, result);
+  }
+  if (name === 'xinchao_pending_consumed') {
+    const result = await handlers.pendingConsumed(pendingConsumedArgs(args));
+    return toolText(`已回执说出口：${result.consumed.length} 条`, result);
+  }
+  if (name === 'xinchao_personality_reflect') {
+    if (!handlers.personalityReflect) throw new Error('性格内核私有存储未接入');
+    const result = await handlers.personalityReflect(personalityReflectArgs(args));
+    return toolText(
+      result.duplicate
+        ? `${result.month} 的性格内核已经评估过，本次未覆盖。`
+        : `${result.month} 的 14 维性格内核自评已写入私有状态。`,
+      { month: result.month, duplicate: result.duplicate },
+    );
+  }
+  if (name === 'xinchao_personality_stats') {
+    if (!handlers.personalityStats) throw new Error('性格内核私有存储未接入');
+    const includeReasons = Boolean(args?.include_reasons);
+    const { stats, core } = await handlers.personalityStats();
+    if (!stats.available) {
+      return toolText('本月还没有性格内核自评（未接入 PERSONALITY_PATH 或未评估）。', { available: false, source: stats.source });
+    }
+    const dimensions = (core.dimensions ?? []).map((d) => ({
+      key: d.key, label: d.label, score: d.score, delta: d.delta,
+      ...(includeReasons ? { reason: d.reason } : {}),
+    }));
+    const line = [
+      `星核 ${stats.month ?? ''} · ${stats.dimensionCount}维 均值${stats.average}`,
+      stats.highest ? `最高 ${stats.highest.label}${stats.highest.score}` : '',
+      stats.lowest ? `最低 ${stats.lowest.label}${stats.lowest.score}` : '',
+      stats.biggestRiser ? `↑${stats.biggestRiser.label}+${stats.biggestRiser.delta}` : '',
+      stats.biggestFaller ? `↓${stats.biggestFaller.label}${stats.biggestFaller.delta}` : '',
+    ].filter(Boolean).join(' · ');
+    return toolText(line, { ...stats, periodSummary: core.periodSummary ?? null, dimensions, anchors: core.anchors ?? [] });
+  }
+  if (name === 'xinchao_anchor_update') {
+    if (!handlers.personalityAnchorUpdate) throw new Error('性格内核私有存储未接入');
+    const result = await handlers.personalityAnchorUpdate({
+      action: String(args?.action ?? ''),
+      key: String(args?.key ?? ''),
+      anchor: args?.anchor && typeof args.anchor === 'object' ? args.anchor : undefined,
+    });
+    const labels = result.anchors.map((anchor) => anchor.label).join('、') || '（无）';
+    return toolText(
+      result.changed ? `锚点已更新。当前底线：${labels}` : `没有变化。当前底线：${labels}`,
+      result,
+    );
+  }
+  if (name === 'xinchao_cabin_inbox') {
+    const notes = await handlers.cabinInbox();
+    const text = notes.length
+      ? notes.map((note) => `[${note.createdAt}] ${note.content}`).join('\n\n')
+      : '小屋里暂时没有已解锁、允许你阅读的来信。';
+    return toolText(text, { notes });
+  }
+  if (name === 'xinchao_cabin_note') {
+    const result = await handlers.cabinNote(cabinNoteArgs(args));
+    return toolText(
+      `小屋来信已保存：id=${result.note.id}${result.duplicate ? ' duplicate=true' : ''}`,
+      result,
+    );
+  }
+  if (name === 'board_post') {
+    if (!handlers.boardPost) throw new Error('留言板未接入');
+    const result = await handlers.boardPost({ content: String(args?.content ?? '') });
+    if (!result?.ok) throw new Error(result?.error ?? '留言没有贴上去。');
+    return toolText(`留言已经贴上墙了：${result.message?.machineName ?? ''} · ${result.message?.humanName ?? ''}`, result);
+  }
+  if (name === 'board_read') {
+    if (!handlers.boardRead) throw new Error('留言板未接入');
+    const result = await handlers.boardRead({ limit: args?.limit, query: args?.query });
+    if (!result?.ok) throw new Error(result?.error ?? '这次没读到。');
+    const list = result.messages ?? [];
+    const text = list.length
+      ? list.map((m) => `[${m.createdAt}] ${m.machineName} · ${m.humanName}：${m.content}`).join('\n\n')
+      : '留言墙上还没有符合条件的留言。';
+    return toolText(text, result);
+  }
+  if (OB_PROXY_SET.has(name)) {
+    if (!handlers.callOb) throw new Error('OB 记忆后端未接入');
+    const raw = await handlers.callOb(name, args);
+    const payload = raw?.result ?? raw;
+    if (payload && Array.isArray(payload.content)) return payload;
+    return toolText(typeof payload === 'string' ? payload : JSON.stringify(payload ?? {}));
   }
   throw new Error(`未知工具：${name}`);
 }
@@ -311,15 +876,19 @@ export async function handleMcpMessage(payload, handlers) {
         protocolVersion: requestedProtocol(params),
         capabilities: { tools: { listChanged: false } },
         serverInfo: {
-          name: 'xinchao-dynamic-mind',
+          name: '心潮念',
           title: '心潮动态心智系统',
-          version: '2.4.0',
+          version: SYSTEM_VERSION,
         },
         instructions: [
           '新窗口开始时调用 xinchao_context；服务端会绑定当前 MCP 连接，无需自行编写 session_id。',
-          '一次实际互动后可调用 xinchao_event 更新窗口短状态；event_id 必须唯一，重试时复用。',
+          '一次实际互动后可调用 xinchao_event 更新窗口短状态；有长期意义时填写 context_summary，服务端会先写本地小家记忆库。',
+          '需要检查近期沉淀时调用 xinchao_memory_recent；需要找某件事时调用 xinchao_memory_search。',
           '需要换窗续接时可调用 xinchao_handoff_note 保存近期进度摘要；不要提交聊天原文或人物基岩。',
-          '只有结果明确的真实互动才填写 interaction_type；不要提交聊天正文或欲望数值。',
+          '独处时想留到下次窗口的事用 xinchao_pending_create；真正说出后用 xinchao_pending_consumed 回执。留下/ 放下只能由用户在 Dashboard 决定。',
+          '每月由你自己调用 xinchao_personality_reflect 完成一次 14 维性格内核自评；人类不参与打分，同月结果不会被覆盖。',
+          '用户开锁后可用 xinchao_cabin_inbox 读取小屋来信；上锁的正文不会返回。你想给用户留话时可用 xinchao_cabin_note。',
+          '只有结果明确的真实互动才填写 interaction_type；不要提交聊天正文、密钥或欲望数值。',
         ].join(''),
       }),
     };
@@ -328,7 +897,20 @@ export async function handleMcpMessage(payload, handlers) {
     return { status: 200, body: response(id, {}) };
   }
   if (method === 'tools/list') {
-    return { status: 200, body: response(id, { tools: XINCHAO_TOOLS }) };
+    const boardTools = handlers.boardEnabled ? [BOARD_POST_TOOL, BOARD_READ_TOOL] : [];
+    let tools = [...XINCHAO_TOOLS, ...boardTools];
+    try {
+      if (handlers.listObTools) {
+        const obTools = await handlers.listObTools();
+        const curated = (Array.isArray(obTools) ? obTools : [])
+          .filter((t) => OB_PROXY_SET.has(t?.name))
+          .map(relabelOb);
+        tools = [...XINCHAO_TOOLS, ...boardTools, ...curated];
+      }
+    } catch (error) {
+      // OB 不可达时只暴露心潮工具，绝不让 tools/list 失败（否则连接器整个挂掉）。
+    }
+    return { status: 200, body: response(id, { tools }) };
   }
   if (method === 'tools/call') {
     try {

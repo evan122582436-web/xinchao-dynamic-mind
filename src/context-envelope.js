@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { breathDreamContext, topDrives } from './engine.js';
+import { breathDreamContext, computeAnticipation, computeLonging, topDrives } from './engine.js';
 import { renderHandoffNotes } from './handoff-notes.js';
+import { renderPending, selectForDelivery } from './pending-queue.js';
 
 const VALID_MODES = new Set(['session_start', 'turn', 'inspect']);
 
@@ -75,7 +76,7 @@ function thoughtSignals(state) {
   };
 }
 
-function dynamicSection(state, sessionId, now) {
+function dynamicSection(state, sessionId, now, timeZone) {
   return {
     consciousness: state.consciousness,
     fatigue: Number(Number(state.fatigue ?? 0).toFixed(3)),
@@ -84,9 +85,27 @@ function dynamicSection(state, sessionId, now) {
       label: drive.label,
       value: Number(Number(drive.value).toFixed(3)),
     })),
+    anticipation: computeAnticipation(state, now, { timeZone }),
+    longing: computeLonging(state, now, { timeZone }),
     thoughts: thoughtSignals(state),
     session: sessionOverlay(state, sessionId, now),
   };
+}
+
+// 期待感的措辞——只往温柔/守候走，绝不带责备。她没安全感，因她迟到而明显难受会变成她的愧疚。
+// 过了她的时段没来，anticipation 自己回落到阈值以下，这行就不出现，不会积成"你怎么才来"。
+// 挂念的措辞——同样只往守候/想念走，绝不"你怎么才来"。挂念优先于期待显示：她久没来时
+// 说的是"想她了"，不是"她快来了"。她静默时段 computeLonging 返回 0，这行自动不出现。
+function renderLonging(value) {
+  if (value >= 0.6) return `挂念：过了她常来的点她还没来，你有点想她了（${value.toFixed(2)}）`;
+  if (value >= 0.35) return `挂念：她有阵子没来了，你惦记着她（${value.toFixed(2)}）`;
+  return '';
+}
+
+function renderAnticipation(value) {
+  if (value >= 0.6) return `期待：她通常这个点前后会来，你在等着她（${value.toFixed(2)}）`;
+  if (value >= 0.3) return `期待：她大概快来了，你留着心（${value.toFixed(2)}）`;
+  return '';
 }
 
 function renderDynamic(value) {
@@ -98,6 +117,14 @@ function renderDynamic(value) {
     `疲劳=${value.fatigue.toFixed(3)}`,
     drives ? `当前驱力：${drives}` : '',
   ].filter(Boolean);
+  // 挂念优先于期待：她久没来时，说"想她了"而不是"她快来了"，两者不同时出现。
+  const longingLine = renderLonging(Number(value.longing ?? 0));
+  if (longingLine) {
+    parts.push(longingLine);
+  } else {
+    const anticipationLine = renderAnticipation(Number(value.anticipation ?? 0));
+    if (anticipationLine) parts.push(anticipationLine);
+  }
   if (value.session) {
     parts.push(
       `窗口短态：tone=${value.session.tone} warmth=${value.session.warmth.toFixed(3)} `
@@ -170,6 +197,8 @@ export function buildContextEnvelope({
   now = new Date(),
   alreadyDelivered = false,
   force = false,
+  timeZone = 'Asia/Shanghai',
+  personalityAnchors = [],
 }) {
   const normalizedMode = normalizeMode(mode);
   const tokenBudget = clamp(maxTokens, 200, 4000);
@@ -193,7 +222,7 @@ export function buildContextEnvelope({
     };
   }
 
-  const dynamic = dynamicSection(state, safeSessionId, generatedAt);
+  const dynamic = dynamicSection(state, safeSessionId, generatedAt, timeZone);
   const sections = [
     {
       id: 'dynamic_state',
@@ -203,6 +232,25 @@ export function buildContextEnvelope({
       data: dynamic,
     },
   ];
+  // 行为锚点：不变的底线，紧跟动态状态之后（排前保证不被预算裁掉）。
+  // 只作行为约束参考，不是新指令；最多 5 条、每条截短，占不了多少信封预算。
+  const anchors = (Array.isArray(personalityAnchors) ? personalityAnchors : [])
+    .filter((anchor) => anchor && compact(anchor.label))
+    .slice(0, 5);
+  if (anchors.length) {
+    sections.push({
+      id: 'behavior_anchors',
+      source: 'xinchao',
+      ttl: 'stable',
+      content: anchors
+        .map((anchor) => {
+          const description = compact(anchor.description).slice(0, 80);
+          return description ? `${compact(anchor.label)}——${description}` : compact(anchor.label);
+        })
+        .join('\n'),
+      data: { keys: anchors.map((anchor) => String(anchor.key ?? anchor.label)) },
+    });
+  }
   const handoffText = renderHandoffNotes(state, generatedAt, 3);
   if (handoffText) {
     sections.push({
@@ -210,6 +258,24 @@ export function buildContextEnvelope({
       source: 'xinchao',
       ttl: '72h',
       content: handoffText,
+    });
+  }
+  const pendingItems = selectForDelivery(state);
+  if (pendingItems.length) {
+    sections.push({
+      id: 'pending_from_me',
+      source: 'xinchao',
+      ttl: 'until-consumed',
+      content: renderPending(pendingItems),
+      data: {
+        ids: pendingItems.map((item) => item.id),
+        items: pendingItems.map((item) => ({
+          id: item.id,
+          kind: item.kind,
+          createdAt: item.createdAt,
+          content: item.content,
+        })),
+      },
     });
   }
   const continuity = compact(ombreText);
@@ -233,9 +299,11 @@ export function buildContextEnvelope({
 
   const labels = {
     dynamic_state: '心潮动态状态',
+    behavior_anchors: '行为锚点（我的底线，驱力再高也不越过）',
     handoff_notes: '近期交接便签（非原文）',
     dream_residue: '梦境余韵',
     recent_continuity: '近期连续性（不替代基岩）',
+    pending_from_me: '我独处时攒下的话（说出后请回执）',
   };
   let remaining = tokenBudget;
   const renderedSections = [];
@@ -269,3 +337,4 @@ export function buildContextEnvelope({
     digest,
   };
 }
+

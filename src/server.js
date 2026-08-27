@@ -1,12 +1,12 @@
 import { createServer } from 'node:http';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { loadConfig, validateConfig } from './config.js';
-import { INTERACTION_TYPES, applyDriveFeedback, applyOmbreHeartbeat, barkAllowed, breathDreamContext, contactIdleAllowed, daytimeEmergenceAllowed, dreamAllowed, newState, pickIntent, proactiveBarkAllowed, recordBark, recordDaytimeEmergence, recordDream, scheduleDaytimeEmergence, settleAndApplyConversationEvent, settleState, topDrives } from './engine.js';
+import { INTERACTION_TYPES, applyDriveFeedback, applyMemoryResonance, applyOmbreHeartbeat, applyOutputReflux, applyLongingNudge, barkAllowed, breathDreamContext, contactIdleAllowed, computeLonging, daytimeEmergenceAllowed, dreamAllowed, newState, pickIntent, proactiveBarkAllowed, recordBark, recordDaytimeEmergence, recordDream, scheduleDaytimeEmergence, settleAndApplyConversationEvent, settleState, topDrives } from './engine.js';
 import { buildInteractionBridgeMessage } from './interaction-messages.js';
 import { selectUniqueBark } from './bark-dedupe.js';
 import { StateStore } from './state-store.js';
 import { ModelClient } from './model-client.js';
-import { OmbreClient } from './ombre-client.js';
+import { OmbreClient, parseSurfacedDomains } from './ombre-client.js';
 import { BarkClient } from './bark-client.js';
 import { readOmbreHeartbeat } from './heartbeat-store.js';
 import { buildContextEnvelope, contextDeliveryState, recordContextDelivery } from './context-envelope.js';
@@ -16,7 +16,14 @@ import { OAuthProvider } from './oauth-provider.js';
 import { recordHandoffNote } from './handoff-notes.js';
 import { DashboardAuth } from './dashboard-auth.js';
 import { buildConnectionManifest, buildDashboardSnapshot } from './dashboard-projection.js';
-import { BRIDGE_SERVER_PROTOCOL, BRIDGE_STREAM_PROTOCOL, BridgeQueue } from './bridge-queue.js';
+import { BRIDGE_SERVER_PROTOCOL, BRIDGE_STREAM_PROTOCOL, BridgeQueue, bridgeDeliveryFromDashboard } from './bridge-queue.js';
+import { CabinStore } from './cabin-store.js';
+import { boardEnabled, postBoardMessage, readBoardMessages } from './board-client.js';
+import { SYSTEM_VERSION } from './version.js';
+import { memoryConnectionState } from './connection-diagnostics.js';
+import { PersonalityStore, computePersonalityStats } from './personality-store.js';
+import { addPending, dropPending, holdPending, markConsumed, markDelivered, markHoldSyncResult, selectForHoldSync } from './pending-queue.js';
+import { LocalMemoryStore } from './local-memory-store.js';
 
 const config = validateConfig(loadConfig());
 if (!config.serviceToken) throw new Error('SERVICE_TOKEN is required');
@@ -40,10 +47,12 @@ const dashboardAuth = new DashboardAuth({
   secureCookies: config.dashboard.publicBaseUrl.startsWith('https://'),
 });
 const bridgeQueue = new BridgeQueue(config.bridge.statePath, config.bridge);
+const cabin = new CabinStore(config.cabin.statePath, config.cabin);
+const personality = new PersonalityStore(config.personalityPath);
+const localMemory = new LocalMemoryStore(config.memory.path, config.memory);
 const bridgeStreams = new Set();
 await oauth.init();
 let cyclePromise = null;
-const SYSTEM_VERSION = '2.6.0';
 
 function log(event, fields = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...fields }));
@@ -98,18 +107,79 @@ async function synchronizeOmbreHeartbeat() {
   return state;
 }
 
+async function synchronizeHeldPending(limit = 3, now = new Date()) {
+  const snapshot = await store.read();
+  const items = selectForHoldSync(snapshot, limit);
+  for (const item of items) {
+    let bucketId = String(item.holdSync?.landedBucketId ?? item.ombreBucketId ?? '').trim();
+    const alreadyLinked = new Set(item.holdSync?.linkedSourceBucketIds ?? []);
+    let newlyLinked = [];
+    try {
+      if (!config.ombre.writeEnabled) throw new Error('ombre_write_disabled');
+      if (!bucketId) bucketId = await ombre.storeHeldOutput(item);
+      const missingSources = (item.sourceOmbreBucketIds ?? [])
+        .filter((id) => id && id !== bucketId && !alreadyLinked.has(id));
+      if (missingSources.length) {
+        newlyLinked = await ombre.traceHeldOutputSources(bucketId, missingSources);
+      }
+      await updateState({
+        type: 'pending_hold_synced', source: 'pending-hold', details: { pendingId: item.id }, at: now,
+      }, (state) => {
+        markHoldSyncResult(state, item.id, {
+          ok: true,
+          ombreBucketId: bucketId,
+          linkedSourceBucketIds: newlyLinked,
+        }, now);
+        state.revision = Number(state.revision ?? 0) + 1;
+        return state;
+      });
+    } catch (error) {
+      await updateState({
+        type: 'pending_hold_retry', source: 'pending-hold', details: { pendingId: item.id }, at: now,
+      }, (state) => {
+        markHoldSyncResult(state, item.id, {
+          ok: false,
+          ombreBucketId: bucketId || null,
+          linkedSourceBucketIds: newlyLinked,
+          error: error.message,
+        }, now);
+        state.revision = Number(state.revision ?? 0) + 1;
+        return state;
+      });
+      log('pending_hold_sync_failed', { pendingId: item.id, message: error.message });
+    }
+  }
+  return items.length;
+}
+
+async function materialFromReferencedBuckets(recalled, maxLines = 7) {
+  const ids = recalled?.bucketIds ?? [];
+  if (!ids.length) return recalled?.text ?? '';
+  try {
+    const previews = await ombre.memoryBucketPreviews(ids, maxLines);
+    const domains = [...new Set(recalled?.domains ?? [])];
+    const domainMeta = domains.length ? `[domain:${domains.join(',')}]\n` : '';
+    const text = previews.map((item) => `${domainMeta}[bucket_id:${item.id}]\n${item.preview}`).join('\n\n');
+    return text || recalled?.text || '';
+  } catch (error) {
+    log('ombre_preview_failed', { count: ids.length, message: error.message });
+    return recalled?.text ?? '';
+  }
+}
+
 async function runCycle() {
   if (cyclePromise) return cyclePromise;
   cyclePromise = (async () => {
     const now = new Date();
     await synchronizeOmbreHeartbeat();
+    const driveBias = await personality.getDriveBias(now);
     let settled;
     await updateState({
       type: 'settle',
       source: 'timer',
       at: now,
     }, (state) => {
-      settled = settleState(state, now, config.sleepAfterMinutes, config.settle);
+      settled = settleState(state, now, config.sleepAfterMinutes, { ...config.settle, driveBias });
       return settled.state;
     });
 
@@ -117,15 +187,36 @@ async function runCycle() {
     let dreamCreated = false;
     let barkSent = false;
     let daytimeSent = false;
+
+    // 挂念：她过了常来的点还没来 → 轻推 monitor(惦记) 进数值（不只在上下文）。
+    // applyLongingNudge 硬顶在 3A 天花板内、不自激；她的静默时段 computeLonging 返回 0，不念。
+    if (config.longing.enabled) {
+      const longing = computeLonging(state, now, { timeZone: config.settle.timeZone, ...config.longing });
+      const preview = longing > 0 ? applyLongingNudge(state, longing, now, config.longing) : { changed: false };
+      if (preview.changed) {
+        state = await updateState({
+          type: 'longing_nudge',
+          source: 'longing',
+          details: { longing: Number(longing.toFixed(3)), applied: preview.applied },
+          at: now,
+        }, (latest) => applyLongingNudge(latest, longing, now, config.longing).state);
+        log('longing_nudge', { longing: Number(longing.toFixed(3)), applied: preview.applied, revision: state.revision });
+      }
+    }
     // Dream residue follows a short quiet period; autonomous contact remains
     // reserved for a genuine long absence.
     const dreamContactIsIdle = contactIdleAllowed(state, now, config.heartbeat.dreamMinIdleHours);
     const proactiveContactIsIdle = contactIdleAllowed(state, now, config.heartbeat.proactiveMinIdleHours);
 
-    if (dreamAllowed(state, now, config.dreamMinIntervalHours, config.dreamMaxPerDay)) {
+    if (config.dreamEnabled && dreamAllowed(state, now, config.dreamMinIntervalHours, config.dreamMaxPerDay)) {
       let material = '';
+      let sourceOmbreBucketIds = [];
       if (!config.shadowMode && config.ombre.readEnabled) {
-        try { material = await ombre.recentMaterial(topDrives(state)); }
+        try {
+          const recalled = await ombre.recentMaterialWithRefs(topDrives(state));
+          sourceOmbreBucketIds = recalled.bucketIds;
+          material = await materialFromReferencedBuckets(recalled);
+        }
         catch (error) { log('ombre_read_failed', { message: error.message }); }
       }
 
@@ -141,7 +232,15 @@ async function runCycle() {
         }
       }
 
-      const dream = { id: randomUUID(), createdAt: now.toISOString(), ...generated, ombreBucketId: null };
+      const dream = {
+        id: randomUUID(),
+        createdAt: now.toISOString(),
+        ...generated,
+        // ombreBucketId 保持旧语义：这场梦写入 OB 后自己的桶。
+        ombreBucketId: null,
+        // 新字段只记梦由哪些真实记忆长出，老状态没有它也完全可读。
+        sourceOmbreBucketIds,
+      };
       if (!config.shadowMode && config.ombre.writeEnabled) {
         try { dream.ombreBucketId = await ombre.storeDream(dream); }
         catch (error) { log('ombre_write_failed', { message: error.message }); }
@@ -190,6 +289,19 @@ async function runCycle() {
               }, (latest) => recordBark(latest, now, { kind: 'dream', message: selected.message }));
               barkSent = true;
               log('bark_sent', { kind: 'dream', revision: state.revision });
+              // 回流补全：他把梦余韵分享给她，也是一次向她的表达 → 回流进思维池（同自主念头）。
+              if (config.reflux.enabled) {
+                const expressed = topDrives(state)[0];
+                if (expressed) {
+                  state = await updateState({
+                    type: 'output_reflux',
+                    source: 'reflux',
+                    details: { kind: 'dream', drive: expressed.key },
+                    at: now,
+                  }, (latest) => applyOutputReflux(latest, expressed.key, selected.message, now, config.reflux.amount).state);
+                  log('output_reflux', { kind: 'dream', drive: expressed.key, revision: state.revision });
+                }
+              }
             }
           }
         } catch (error) { log('bark_failed', { kind: 'dream', message: error.message }); }
@@ -202,9 +314,26 @@ async function runCycle() {
       // 只取一次：selectUniqueBark 去重失败时会重试生成，材料跟着重取的话
       // 一条通知能打出好几次 OB 往返，而浮现的东西本来就该是同一件事。
       let thoughtMaterial = '';
+      let thoughtSourceBucketIds = [];
       if (config.ombre.readEnabled) {
-        try { thoughtMaterial = await ombre.thoughtMaterial(topDrives(state)); }
+        try {
+          const recalled = await ombre.thoughtMaterialWithRefs(topDrives(state));
+          thoughtSourceBucketIds = recalled.bucketIds;
+          thoughtMaterial = await materialFromReferencedBuckets(recalled, 5);
+        }
         catch (error) { log('ombre_read_failed', { message: error.message }); }
+      }
+      if (config.resonance.enabled && thoughtMaterial) {
+        const domains = parseSurfacedDomains(thoughtMaterial);
+        if (domains.length) {
+          state = await updateState({
+            type: 'memory_resonance',
+            source: 'resonance',
+            details: { kind: 'autonomous_thought', domains: domains.slice(0, 8).join(',') },
+            at: now,
+          }, (latest) => applyMemoryResonance(latest, domains, now, config.resonance).state);
+          log('memory_resonance', { kind: 'autonomous_thought', domains: domains.length, revision: state.revision });
+        }
       }
       try {
         selected = await selectUniqueBark({
@@ -240,6 +369,28 @@ async function runCycle() {
             }, (latest) => recordBark(latest, now, { kind: 'autonomous_thought', message: selected.message }));
             barkSent = true;
             log('bark_sent', { kind: 'autonomous_thought', source: selected.candidate?.source, revision: state.revision });
+            if (config.reflux.enabled) {
+              const expressed = topDrives(state)[0];
+              if (expressed) {
+                state = await updateState({
+                  type: 'output_reflux',
+                  source: 'reflux',
+                  details: { kind: 'autonomous_thought', drive: expressed.key },
+                  at: now,
+                }, (latest) => applyOutputReflux(
+                  latest,
+                  expressed.key,
+                  selected.message,
+                  now,
+                  config.reflux.amount,
+                  {
+                    ombreBucketId: thoughtSourceBucketIds[0] ?? null,
+                    sourceOmbreBucketIds: thoughtSourceBucketIds,
+                  },
+                ).state);
+                log('output_reflux', { kind: 'autonomous_thought', drive: expressed.key, revision: state.revision });
+              }
+            }
           }
         } catch (error) { log('bark_failed', { kind: 'autonomous_thought', message: error.message }); }
       }
@@ -255,7 +406,20 @@ async function runCycle() {
     } else if (!config.shadowMode && config.daytime.enabled && config.ombre.readEnabled && config.bark.enabled && daytimeEmergenceAllowed(state, now, config.daytime)) {
       let selected = { message: '', candidate: { source: 'none' }, reason: 'empty', attempts: 1 };
       try {
-        const material = await ombre.daytimeMaterial(topDrives(state));
+        const recalled = await ombre.daytimeMaterialWithRefs(topDrives(state));
+        const material = await materialFromReferencedBuckets(recalled, 5);
+        if (config.resonance.enabled && material) {
+          const domains = parseSurfacedDomains(material);
+          if (domains.length) {
+            state = await updateState({
+              type: 'memory_resonance',
+              source: 'resonance',
+              details: { kind: 'daytime_emergence', domains: domains.slice(0, 8).join(',') },
+              at: now,
+            }, (latest) => applyMemoryResonance(latest, domains, now, config.resonance).state);
+            log('memory_resonance', { kind: 'daytime_emergence', domains: domains.length, revision: state.revision });
+          }
+        }
         if (material.trim()) {
           selected = await selectUniqueBark({
             state,
@@ -281,6 +445,28 @@ async function runCycle() {
             }, (latest) => recordDaytimeEmergence(latest, selected.message, now, config.daytime.timeZone));
             daytimeSent = true;
             log('bark_sent', { kind: 'daytime_emergence', source: selected.candidate?.source, revision: state.revision });
+            if (config.reflux.enabled) {
+              const expressed = topDrives(state)[0];
+              if (expressed) {
+                state = await updateState({
+                  type: 'output_reflux',
+                  source: 'reflux',
+                  details: { kind: 'daytime_emergence', drive: expressed.key },
+                  at: now,
+                }, (latest) => applyOutputReflux(
+                  latest,
+                  expressed.key,
+                  selected.message,
+                  now,
+                  config.reflux.amount,
+                  {
+                    ombreBucketId: recalled.bucketIds[0] ?? null,
+                    sourceOmbreBucketIds: recalled.bucketIds,
+                  },
+                ).state);
+                log('output_reflux', { kind: 'daytime_emergence', drive: expressed.key, revision: state.revision });
+              }
+            }
           }
         } catch (error) {
           log('bark_failed', { kind: 'daytime_emergence', message: error.message });
@@ -295,6 +481,7 @@ async function runCycle() {
       }, (latest) => scheduleDaytimeEmergence(latest, now, config.daytime.minIntervalHours, config.daytime.maxIntervalHours));
       log('daytime_emergence_scheduled', { nextAt: state.nextDaytimeEmergenceAt, revision: state.revision });
     }
+    await synchronizeHeldPending(3, now);
     return { state, dreamCreated, barkSent, daytimeSent };
   })().finally(() => { cyclePromise = null; });
   return cyclePromise;
@@ -374,32 +561,24 @@ async function body(request) {
   let raw = '';
   for await (const chunk of request) {
     raw += chunk;
-    if (raw.length > 64 * 1024) throw new Error('request body too large');
+    if (raw.length > 1024 * 1024) throw new Error('request body too large');
   }
   return raw ? JSON.parse(raw) : {};
 }
 
 /**
- * 浏览器直连模式的跨源放行。
- *
- * 心潮和浏览器在同一台机器上时（自己电脑、或手机 Termux），网页前端可以
- * 不经过任何中间服务器直接读这台心潮 —— 数据一步都不出本机。
- *
- * 默认不放行任何来源：只有部署方把来源写进 DASHBOARD_ALLOWED_ORIGINS 才生效，
- * 不填时行为与以前逐字节相同。
- *
- * 刻意不发 Access-Control-Allow-Credentials：直连用 Authorization 头鉴权，
- * 不需要跨源 Cookie，也就不给 Cookie 留任何口子。
+ * 只为 Dashboard 浏览器直连开放受控 CORS。
+ * 默认不放行；部署者必须把完整前端来源写入 DASHBOARD_ALLOWED_ORIGINS。
+ * 直连只使用 Authorization 会话头，不开放跨源 Cookie。
  */
 function applyDashboardCors(request, response, url) {
   if (!url.pathname.startsWith('/dashboard/')) return false;
   const origin = String(request.headers.origin ?? '').replace(/\/$/, '');
   if (!origin) return false;
-  // 无论放不放行都要声明 Vary，否则中间缓存可能把一个来源的响应喂给另一个。
   response.setHeader('Vary', 'Origin');
   if (!config.dashboard.allowedOrigins.includes(origin)) return false;
   response.setHeader('Access-Control-Allow-Origin', origin);
-  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
   response.setHeader('Access-Control-Max-Age', '600');
   return true;
@@ -428,7 +607,19 @@ function dashboardTimelineOptions(url) {
 
 async function dashboardPayload(pathname, url) {
   if (pathname.endsWith('/snapshot')) {
-    return buildDashboardSnapshot(await store.read(), config, new Date());
+    const now = new Date();
+    const [state, personalityCore, recentMemories] = await Promise.all([
+      store.read(),
+      personality.getPersonalityCore(now),
+      config.memory.enabled ? localMemory.recent({ limit: 6 }) : [],
+    ]);
+    return {
+      ...buildDashboardSnapshot(state, config, now, personalityCore),
+      localMemory: {
+        available: Boolean(config.memory.enabled),
+        recent: recentMemories,
+      },
+    };
   }
   if (pathname.endsWith('/timeline')) {
     return {
@@ -437,7 +628,70 @@ async function dashboardPayload(pathname, url) {
       items: await journal.list(dashboardTimelineOptions(url)),
     };
   }
+  if (pathname.endsWith('/memory-map')) {
+    if (!config.ombre.readEnabled) {
+      return {
+        schemaVersion: 2,
+        generatedAt: new Date().toISOString(),
+        available: false,
+        reason: memoryConnectionState(config),
+        total: 0,
+        stats: {},
+        stars: [],
+        edges: [],
+        capabilities: {
+          explicitRelations: false,
+          driveSnapshots: false,
+          driveAffinity: false,
+          timestamps: false,
+        },
+      };
+    }
+    try {
+      return await ombre.memoryMap();
+    } catch (error) {
+      log('dashboard_memory_map_failed', { message: error.message });
+      return {
+        schemaVersion: 2,
+        generatedAt: new Date().toISOString(),
+        available: false,
+        reason: 'ombre_unavailable',
+        total: 0,
+        stats: {},
+        stars: [],
+        edges: [],
+        capabilities: {
+          explicitRelations: false,
+          driveSnapshots: false,
+          driveAffinity: false,
+          timestamps: false,
+        },
+      };
+    }
+  }
+  if (pathname.endsWith('/memory-bucket')) {
+    const bucketId = String(url.searchParams.get('id') ?? '').trim();
+    if (!/^[A-Za-z0-9._-]{1,160}$/.test(bucketId)) {
+      return { schemaVersion: 1, available: false, reason: 'invalid_id', id: bucketId, preview: '', lineCount: 0, truncated: false };
+    }
+    try {
+      return await ombre.memoryBucketPreview(bucketId, 7);
+    } catch (error) {
+      log('dashboard_memory_bucket_failed', { bucket: auditEventFingerprint(bucketId), message: error.message });
+      return { schemaVersion: 1, available: false, reason: 'ombre_unavailable', id: bucketId, preview: '', lineCount: 0, truncated: false };
+    }
+  }
   if (pathname.endsWith('/connect')) return buildConnectionManifest(config);
+  if (pathname.endsWith('/cabin')) return cabin.snapshot();
+  if (pathname.endsWith('/personality')) return personality.getPersonalityCore();
+  if (pathname.endsWith('/pending')) {
+    const state = await store.read();
+    return {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      items: (state.pending ?? []).map((item) => structuredClone(item)),
+    };
+  }
   return null;
 }
 
@@ -478,6 +732,9 @@ async function createContextEnvelope({
       log('context_ombre_read_failed', { message: error.message });
     }
   }
+  // 行为锚点随信封下发（缓存读取，极便宜）；读不到就当没有，不阻塞信封。
+  let personalityAnchors = [];
+  try { personalityAnchors = (await personality.getPersonalityCore(now)).anchors ?? []; } catch { personalityAnchors = []; }
   const envelope = buildContextEnvelope({
     state,
     sessionId,
@@ -488,8 +745,12 @@ async function createContextEnvelope({
     now,
     alreadyDelivered: delivery.alreadyDelivered,
     force,
+    timeZone: config.settle.timeZone,
+    personalityAnchors,
   });
   if (envelope.delivered) {
+    const pendingIds = envelope.sections
+      .find((section) => section.id === 'pending_from_me')?.data?.ids ?? [];
     state = await updateState({
       type: 'context_delivery',
       source: 'context-adapter',
@@ -503,12 +764,18 @@ async function createContextEnvelope({
         sectionCount: envelope.sections.length,
       },
       at: now,
-    }, (current) => recordContextDelivery(current, {
-      sessionId,
-      mode,
-      digest: envelope.digest,
-      deliveredAt: now,
-    }));
+    }, (current) => {
+      const next = recordContextDelivery(current, {
+        sessionId,
+        mode,
+        digest: envelope.digest,
+        deliveredAt: now,
+      });
+      if (pendingIds.length && markDelivered(next, pendingIds, now)) {
+        next.revision = Number(next.revision ?? 0) + 1;
+      }
+      return next;
+    });
   }
   try {
     await journal.recordContext({
@@ -531,6 +798,7 @@ async function createContextEnvelope({
 async function recordConversationEvent(event, source = 'api', now = new Date()) {
   let applied;
   const auditDetails = {};
+  const driveBias = await personality.getDriveBias(now);
   const state = await updateState({
     type: source === 'heartbeat' ? 'conversation_heartbeat' : 'conversation_event',
     source: source === 'mcp' ? 'mcp' : 'api',
@@ -541,8 +809,11 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
   }, (current) => {
     applied = settleAndApplyConversationEvent(current, event, now, {
       sleepAfterMinutes: config.sleepAfterMinutes,
-      settle: config.settle,
+      settle: { ...config.settle, driveBias },
       interaction: config.interaction,
+      // 作息预期只从她真实的到来学习，心跳不算。
+      recordArrival: config.anticipation.enabled && source !== 'heartbeat',
+      arrivalGapMinutes: config.anticipation.arrivalGapMinutes,
     });
     Object.assign(auditDetails, {
       changed: applied.changed,
@@ -553,6 +824,73 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
     });
     return applied.state;
   });
+  const localAutoMemory = {
+    attempted: false,
+    ok: false,
+    id: null,
+    duplicate: false,
+    error: null,
+  };
+  const ombreAutoMemory = {
+    attempted: false,
+    ok: false,
+    bucketId: null,
+    error: null,
+  };
+  const hasMemorySignal = Boolean(
+    String(event.contextSummary ?? event.context_summary ?? '').trim()
+    || String(event.interactionType ?? event.interaction_type ?? '').trim()
+    || Object.keys(event.sessionState ?? {}).length
+  );
+  if (config.memory.enabled && !applied.duplicate && hasMemorySignal && event?.autoMemory !== false) {
+    localAutoMemory.attempted = true;
+    try {
+      const written = await localMemory.writeConversationEvent(event, applied, { source }, now);
+      localAutoMemory.ok = Boolean(written.item);
+      localAutoMemory.id = written.item?.id ?? null;
+      localAutoMemory.duplicate = Boolean(written.duplicate);
+      if (written.item) {
+        log('local_memory_event_written', {
+          id: auditEventFingerprint(written.item.id),
+          kind: written.item.kind,
+          duplicate: Boolean(written.duplicate),
+        });
+      }
+    } catch (error) {
+      localAutoMemory.error = error.message;
+      log('local_memory_event_write_failed', {
+        interaction: applied.interaction?.type ?? null,
+        message: error.message,
+      });
+    }
+  }
+  if (config.ombre.eventWriteEnabled && !applied.duplicate) {
+    if (hasMemorySignal) {
+      ombreAutoMemory.attempted = true;
+      try {
+        const bucketId = await ombre.storeConversationEvent(event, applied);
+        ombreAutoMemory.ok = Boolean(bucketId);
+        ombreAutoMemory.bucketId = bucketId;
+        log('ombre_event_written', {
+          bucket: bucketId ? auditEventFingerprint(bucketId) : null,
+          interaction: applied.interaction?.type ?? null,
+          accepted: Boolean(bucketId),
+        });
+      } catch (error) {
+        ombreAutoMemory.error = error.message;
+        log('ombre_event_write_failed', {
+          interaction: applied.interaction?.type ?? null,
+          message: error.message,
+        });
+      }
+    }
+  }
+  const autoMemory = {
+    ...localAutoMemory,
+    local: localAutoMemory,
+    ombre: ombreAutoMemory,
+    bucketId: ombreAutoMemory.bucketId,
+  };
   return {
     revision: state.revision,
     consciousness: state.consciousness,
@@ -562,7 +900,35 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
     duplicate: applied.duplicate,
     interaction: applied.interaction,
     settledHours: Number(applied.settled.elapsedHours.toFixed(4)),
+    autoMemory,
   };
+}
+
+async function createPendingOutput(input, source = 'mcp', now = new Date()) {
+  let item;
+  let duplicate = false;
+  const state = await updateState({
+    type: 'pending_created', source, details: { kind: input.kind }, at: now,
+  }, (current) => {
+    const beforeIds = new Set((current.pending ?? []).map((entry) => entry.id));
+    item = addPending(current, input, now);
+    duplicate = Boolean(item && beforeIds.has(item.id));
+    if (item) current.revision = Number(current.revision ?? 0) + 1;
+    return current;
+  });
+  return { item, duplicate, revision: state.revision };
+}
+
+async function consumePendingOutputs(ids, source = 'mcp', now = new Date()) {
+  let consumed = [];
+  const state = await updateState({
+    type: 'pending_consumed', source, details: { count: ids.length }, at: now,
+  }, (current) => {
+    consumed = markConsumed(current, ids, now);
+    if (consumed.length) current.revision = Number(current.revision ?? 0) + 1;
+    return current;
+  });
+  return { consumed, revision: state.revision };
 }
 
 async function saveHandoffNote(note, source = 'mcp', now = new Date()) {
@@ -620,25 +986,39 @@ async function enqueueDashboardInteraction(event, result) {
   return { queued: true, deliveryId: queued.delivery.id, duplicate: queued.duplicate };
 }
 
-function bridgeDeliveryFromDashboard(payload = {}, now = new Date()) {
-  const allowed = new Set(['event_id', 'eventId', 'message', 'deliver_after', 'deliverAfter']);
-  const unexpected = Object.keys(payload).filter((key) => !allowed.has(key));
-  if (unexpected.length) throw new Error('bridge delivery only accepts event_id, message and deliver_after');
-  const eventId = String(payload.event_id ?? payload.eventId ?? '').trim();
-  const message = String(payload.message ?? '').replace(/\s+/g, ' ').trim();
-  const deliverAfter = payload.deliver_after ?? payload.deliverAfter ?? null;
-  if (eventId.length < 8 || eventId.length > 120) throw new Error('event_id must contain 8 to 120 characters');
-  if (!message || message.length > 1200) throw new Error('message must contain 1 to 1200 characters');
-  const scheduled = deliverAfter && Date.parse(deliverAfter) > now.getTime();
-  return { eventId, message, deliverAfter, reason: scheduled ? 'scheduled_interaction' : 'user_note' };
-}
-
 function handoffNoteFromHttp(payload = {}) {
   return {
     sessionId: payload.sessionId ?? payload.session_id,
     eventId: payload.eventId ?? payload.event_id,
     note: payload.note,
     ttlHours: payload.ttlHours ?? payload.ttl_hours,
+  };
+}
+
+async function enqueueCabinNotice({ eventId, message }) {
+  if (!config.bridge.enabled) return null;
+  const queued = await bridgeQueue.enqueue({ eventId, reason: 'user_note', message });
+  await publishReadyBridgeDeliveries();
+  return { queued: true, duplicate: queued.duplicate, deliveryId: queued.delivery.id };
+}
+
+function cabinNoteInput(payload = {}, defaultFrom = 'user') {
+  return {
+    eventId: payload.event_id ?? payload.eventId,
+    from: payload.from ?? defaultFrom,
+    content: payload.content,
+    timestamp: payload.timestamp,
+    locked: payload.locked,
+  };
+}
+
+function cabinLedgerInput(payload = {}) {
+  return {
+    eventId: payload.event_id ?? payload.eventId,
+    type: payload.type,
+    item: payload.item,
+    amount: payload.amount,
+    date: payload.date,
   };
 }
 
@@ -713,9 +1093,8 @@ const server = createServer(async (request, response) => {
         return send(response, 401, { error: 'invalid credentials' });
       }
       const session = dashboardAuth.createSession();
-      // 浏览器直连拿不到 HttpOnly Cookie，只能把 token 交到 JS 手里。
-      // 这是实打实的降级，所以必须由调用方显式要求，不能因为「顺手也返回」
-      // 而让同源前端意外持有 token —— 同源那条路的价值就是浏览器从不碰它。
+      // 跨源直连必须由调用方显式选择 header 模式；同源模式仍只下发
+      // HttpOnly Cookie，避免普通 Dashboard 前端接触会话 token。
       const headerMode = String(payload.mode ?? '').toLowerCase() === 'header';
       log('dashboard_session_created', { sessionExpiresAt: session.expiresAt, headerMode });
       const responseBody = {
@@ -744,6 +1123,44 @@ const server = createServer(async (request, response) => {
           return send(response, 400, { error: error.message });
         }
       }
+      if (url.pathname === '/dashboard/api/pending') {
+        if (request.method === 'GET') {
+          return send(response, 200, await dashboardPayload(url.pathname, url));
+        }
+        if (request.method === 'PATCH') {
+          try {
+            const payload = await body(request);
+            const ids = Array.isArray(payload.ids)
+              ? [...new Set(payload.ids.map(String).map((id) => id.trim()).filter(Boolean))].slice(0, 12)
+              : [];
+            if (!ids.length) return send(response, 400, { error: 'ids required' });
+            let affected = [];
+            const action = String(payload.action ?? '').trim().toLowerCase();
+            let state = await updateState({
+              type: action === 'hold' ? 'pending_held' : 'pending_dropped',
+              source: 'dashboard',
+              details: { action, count: ids.length },
+              at: new Date(),
+            }, (current) => {
+              if (action === 'hold') affected = holdPending(current, ids);
+              else if (action === 'drop') affected = dropPending(current, ids);
+              else throw new Error('action must be hold or drop');
+              if (affected.length) current.revision = Number(current.revision ?? 0) + 1;
+              return current;
+            });
+            if (action === 'hold' && affected.length) {
+              await synchronizeHeldPending(affected.length);
+              // hold 可能紧接着完成 OB 落地/失败重试记账；返回最新修订号，
+              // 避免 Dashboard 用过期 revision 覆盖刚刚发生的同步结果。
+              state = await store.read();
+            }
+            return send(response, 200, { action, affected, revision: state.revision });
+          } catch (error) {
+            return send(response, 400, { error: error.message });
+          }
+        }
+        return send(response, 405, { error: 'method not allowed' }, { Allow: 'GET, PATCH' });
+      }
       if (url.pathname === '/dashboard/api/bridge/deliveries') {
         if (!config.bridge.enabled) return send(response, 503, { error: 'bridge disabled' });
         if (request.method === 'GET') {
@@ -766,6 +1183,84 @@ const server = createServer(async (request, response) => {
           }
         }
         return send(response, 405, { error: 'method not allowed' }, { Allow: 'GET, POST' });
+      }
+      if (url.pathname === '/dashboard/api/cabin/note') {
+        if (request.method === 'POST') {
+          try {
+            const result = await cabin.addNote(cabinNoteInput(await body(request)));
+            let bridge = null;
+            if (result.note.from === 'user' && !result.duplicate) {
+              bridge = await enqueueCabinNotice({
+                eventId: result.note.eventId,
+                message: result.note.locked
+                  ? `${config.identity.notificationRecipient}在小屋里留了一封上锁的信。你可以知道它存在，但在对方主动开锁前不能读取正文。`
+                  : `${config.identity.notificationRecipient}在小屋里留了一封已经允许你阅读的信。请通过“小屋收件箱”读取。`,
+              });
+            }
+            return send(response, result.duplicate ? 200 : 201, { ...result, bridge });
+          } catch (error) {
+            return send(response, 400, { error: error.message });
+          }
+        }
+        if (request.method === 'PATCH') {
+          try {
+            const payload = await body(request);
+            if (payload.read === true || payload.read_all === true) {
+              return send(response, 200, await cabin.markAiNotesRead(payload.ids));
+            }
+            if (typeof payload.locked === 'boolean') {
+              const note = await cabin.setNoteLock(payload.id, payload.locked);
+              if (!note) return send(response, 404, { error: 'note not found' });
+              let bridge = null;
+              if (!note.locked) {
+                bridge = await enqueueCabinNotice({
+                  eventId: `unlock:${note.eventId}`,
+                  message: `${config.identity.notificationRecipient}刚刚打开了小屋里那封信的锁，现在允许你通过“小屋收件箱”读取正文。`,
+                });
+              }
+              return send(response, 200, { note, bridge });
+            }
+            return send(response, 400, { error: 'unsupported note update' });
+          } catch (error) {
+            return send(response, 400, { error: error.message });
+          }
+        }
+        return send(response, 405, { error: 'method not allowed' }, { Allow: 'POST, PATCH' });
+      }
+      if (url.pathname === '/dashboard/api/cabin/ledger') {
+        try {
+          if (request.method === 'POST') {
+            const result = await cabin.addLedger(cabinLedgerInput(await body(request)));
+            const bridge = result.duplicate ? null : await enqueueCabinNotice({
+              eventId: result.entry.eventId,
+              message: `${config.identity.notificationRecipient}在恋爱账本里记下了一笔${result.entry.type === 'expense' ? '支出' : '收入'}：${result.entry.item}，金额 ${result.entry.amount.toFixed(2)}。`,
+            });
+            return send(response, result.duplicate ? 200 : 201, { ...result, bridge });
+          }
+          if (request.method === 'PATCH') {
+            const payload = await body(request);
+            const entry = await cabin.updateLedger(payload.id, payload);
+            if (!entry) return send(response, 404, { error: 'ledger entry not found' });
+            const bridge = await enqueueCabinNotice({
+              eventId: `ledger-edit:${entry.id}:${Date.now()}`,
+              message: `${config.identity.notificationRecipient}更新了恋爱账本中的“${entry.item}”。`,
+            });
+            return send(response, 200, { entry, bridge });
+          }
+          if (request.method === 'DELETE') {
+            const payload = await body(request);
+            const entry = await cabin.deleteLedger(payload.id);
+            if (!entry) return send(response, 404, { error: 'ledger entry not found' });
+            const bridge = await enqueueCabinNotice({
+              eventId: `ledger-delete:${entry.id}:${Date.now()}`,
+              message: `${config.identity.notificationRecipient}从恋爱账本里删除了“${entry.item}”。`,
+            });
+            return send(response, 200, { deleted: true, entry, bridge });
+          }
+        } catch (error) {
+          return send(response, 400, { error: error.message });
+        }
+        return send(response, 405, { error: 'method not allowed' }, { Allow: 'POST, PATCH, DELETE' });
       }
       if (request.method !== 'GET') return send(response, 405, { error: 'method not allowed' }, { Allow: 'GET' });
       const payload = await dashboardPayload(url.pathname, url);
@@ -804,9 +1299,34 @@ const server = createServer(async (request, response) => {
             duplicate: result.duplicate,
             interaction: result.interaction,
             settledHours: result.settledHours,
+            autoMemory: result.autoMemory,
           };
         },
+        memoryWrite: async (input) => localMemory.write(input),
+        memoryRecent: async (input) => localMemory.recent(input),
+        memorySearch: async (input) => localMemory.search(input),
+        memoryForget: async ({ id, reason }) => localMemory.forget(id, reason),
         handoffNote: async (note) => saveHandoffNote(note, 'mcp'),
+        pendingCreate: async (input) => createPendingOutput(input, 'mcp'),
+        pendingConsumed: async ({ ids }) => consumePendingOutputs(ids, 'mcp'),
+        personalityReflect: async (input) => personality.recordAiAssessment(input),
+        personalityStats: async () => {
+          const core = await personality.getPersonalityCore();
+          return { stats: computePersonalityStats(core), core };
+        },
+        personalityAnchorUpdate: async (input) => personality.updateAnchors(input),
+        cabinInbox: async () => cabin.unlockedUserNotes(),
+        cabinNote: async (note) => cabin.addNote({ ...note, from: 'ai', locked: false }),
+        // 公共留言板：只有配了令牌才把 board_post / board_read 工具暴露出来 / 接受调用。
+        boardEnabled: boardEnabled(config),
+        boardPost: async ({ content }) => postBoardMessage(config, content),
+        boardRead: async ({ limit, query }) => readBoardMessages(config, { limit, query }),
+        // 心潮念网关：把 OB 记忆工具经心潮同一端点暴露/转发。
+        listObTools: async () => {
+          if (!config.ombre.readEnabled) return [];
+          return ombre.listTools();
+        },
+        callOb: async (name, args) => ombre.call(name, args),
       });
       if (payload?.method === 'initialize' || payload?.method === 'tools/call') {
         log('mcp_request', {
@@ -830,6 +1350,44 @@ const server = createServer(async (request, response) => {
 
     if (request.method === 'GET' && url.pathname === '/v1/state') {
       return send(response, 200, await store.read());
+    }
+    if (url.pathname === '/v1/memories') {
+      if (request.method === 'GET') {
+        return send(response, 200, {
+          memories: await localMemory.recent({
+            limit: url.searchParams.get('limit') ?? 10,
+            kind: url.searchParams.get('kind') ?? '',
+          }),
+        });
+      }
+      if (request.method === 'POST') {
+        const payload = await body(request);
+        return send(response, 200, await localMemory.write({
+          kind: payload.kind,
+          title: payload.title,
+          summary: payload.summary,
+          tags: payload.tags,
+          salience: payload.salience,
+          source: 'api',
+          sourceEventId: payload.source_event_id ?? payload.sourceEventId,
+          sessionId: payload.session_id ?? payload.sessionId,
+        }));
+      }
+      return send(response, 405, { error: 'method not allowed' }, { Allow: 'GET, POST' });
+    }
+    if (url.pathname === '/v1/memories/search') {
+      if (request.method !== 'GET') return send(response, 405, { error: 'method not allowed' }, { Allow: 'GET' });
+      return send(response, 200, {
+        memories: await localMemory.search({
+          query: url.searchParams.get('q') ?? url.searchParams.get('query') ?? '',
+          limit: url.searchParams.get('limit') ?? 10,
+          kind: url.searchParams.get('kind') ?? '',
+        }),
+      });
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/memories/forget') {
+      const payload = await body(request);
+      return send(response, 200, await localMemory.forget(payload.id, payload.reason));
     }
     if (request.method === 'GET' && url.pathname === '/v1/breath-context') {
       const state = await store.read();
@@ -892,6 +1450,7 @@ const server = createServer(async (request, response) => {
 
 server.listen(config.port, '0.0.0.0', async () => {
   await store.read();
+  await cabin.init();
   if (config.bridge.enabled) await bridgeQueue.init();
   log('service_started', { port: config.port, shadow: config.shadowMode, modelEnabled: config.model.enabled, barkEnabled: config.bark.enabled, bridgeEnabled: config.bridge.enabled });
 });
