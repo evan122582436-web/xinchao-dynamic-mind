@@ -1,5 +1,7 @@
 import { DIMENSIONS, DRIVE_KEYS } from './dimensions.js';
 import { buildConnectionDiagnostics } from './connection-diagnostics.js';
+import { emotionSummary } from './emotion.js';
+import { awarenessSummary } from './awareness.js';
 
 const clamp = (value, min = 0, max = 1) => Math.max(min, Math.min(max, Number(value) || 0));
 
@@ -83,7 +85,10 @@ function projectedDreams(state, includePrivateText, limit = 12) {
       hasSummary: Boolean(summary),
       hasAwareness: Boolean(compact(dream?.awareness)),
       lucidity,
+      // 3.3：醒来心情公开（只是两个数），意象随正文挂私密门
+      mood: dream?.mood && Number.isFinite(Number(dream.mood.valence)) ? { valence: Number(clamp(dream.mood.valence).toFixed(3)), arousal: Number(clamp(dream.mood.arousal).toFixed(3)) } : null,
       ...(includePrivateText ? {
+        image: compact(dream?.image, 24) || null,
         dream: compact(dream?.dream, 4000) || null,
         summary,
         residue: compact(dream?.residue, 1200) || null,
@@ -91,81 +96,6 @@ function projectedDreams(state, includePrivateText, limit = 12) {
       } : {}),
     };
   });
-}
-
-function hashText(value) {
-  let hash = 2166136261;
-  for (const char of String(value ?? '')) {
-    hash ^= char.codePointAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
-}
-
-function dreamAgeMinutes(dream, now) {
-  const createdAt = Date.parse(dream?.createdAt ?? '');
-  if (!Number.isFinite(createdAt)) return null;
-  return Math.max(0, Math.floor((now.getTime() - createdAt) / 60_000));
-}
-
-function buildDreamCloud(state, includePrivateText, now, topDrives = []) {
-  const dreams = Array.isArray(state?.recentDreams) ? state.recentDreams : [];
-  const latest = dreams
-    .filter((dream) => Number.isFinite(Date.parse(dream?.createdAt ?? '')))
-    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
-  const driveLabel = topDrives[0]?.label ?? '安静';
-  if (!latest) {
-    const sleeping = String(state?.consciousness ?? '').toLowerCase() === 'sleeping';
-    return {
-      available: false,
-      text: sleeping ? '云还在睡眠里慢慢攒起来。' : `云很薄，${driveLabel}还没有落成梦。`,
-      source: 'state',
-      dreamId: null,
-      createdAt: null,
-      ageMinutes: null,
-      privateTextIncluded: false,
-    };
-  }
-
-  const privateText = compact(latest?.summary || latest?.awareness || latest?.residue, 180);
-  if (includePrivateText && privateText) {
-    return {
-      available: true,
-      text: privateText,
-      source: compact(latest?.source, 60) || 'unknown',
-      dreamId: compact(latest?.id, 120) || null,
-      createdAt: validDate(latest?.createdAt),
-      ageMinutes: dreamAgeMinutes(latest, now),
-      privateTextIncluded: true,
-    };
-  }
-
-  const lucidity = Number(latest?.lucidity);
-  const texture = Number.isFinite(lucidity) && lucidity >= 0.55 ? '清醒一点' : '柔软';
-  const variants = [
-    `一团${texture}的梦还绕着${driveLabel}，醒后的雾没有完全散。`,
-    `${driveLabel}在云里亮了一下，留下很轻的梦境余韵。`,
-    `新的梦已经结算过了，云边还挂着一点${driveLabel}。`,
-    `这朵云刚从睡眠里飘出来，里面藏着${driveLabel}的影子。`,
-  ];
-  const seed = [
-    latest.id,
-    latest.createdAt,
-    latest.source,
-    latest.lucidity,
-    latest.hashed ?? '',
-    latest.residue ? String(latest.residue).length : 0,
-    latest.awareness ? String(latest.awareness).length : 0,
-  ].join('|');
-  return {
-    available: true,
-    text: variants[hashText(seed) % variants.length],
-    source: compact(latest?.source, 60) || 'unknown',
-    dreamId: compact(latest?.id, 120) || null,
-    createdAt: validDate(latest?.createdAt),
-    ageMinutes: dreamAgeMinutes(latest, now),
-    privateTextIncluded: false,
-  };
 }
 
 function activeSessionCount(state, now) {
@@ -235,14 +165,23 @@ export function buildDashboardSnapshot(state = {}, config = {}, now = new Date()
     },
     drives,
     topDrives,
+    // 情绪层（3.3）：此刻的心情，和驱力分开。成因是互动类型名，不含正文。
+    emotion: {
+      ...emotionSummary(state, generatedAt),
+      journal: (Array.isArray(state.emotionJournal) ? state.emotionJournal : []).slice(-48),
+      days: state.emotionDays && typeof state.emotionDays === 'object' ? state.emotionDays : {},
+    },
     personality: projectedPersonality(personalityCore, config),
+    // 自我觉察（3.3）：候选与已确认，文本是关于 AI 自己的模式描述，不含对话正文。
+    awareness: awarenessSummary(state),
+    // 心潮自身信号（3.3）：他不在窗口时心潮记下并递出去的那几句。只有类型、时间和那一句，没有正文以外的东西。
+    signals: (() => {
+      const history = Array.isArray(state.selfSignals?.history) ? state.selfSignals.history : [];
+      const recent = history.slice(-20).reverse().map((item) => ({ kind: compact(item?.kind, 40), subject: compact(item?.subject, 40), text: compact(item?.text, 80) || null, at: validDate(item?.at) }));
+      const dayAgo = generatedAt.getTime() - 24 * 3_600_000;
+      return { last24h: history.filter((item) => Date.parse(item?.at ?? '') >= dayAgo).length, recent };
+    })(),
     thoughts: projectedThoughts(state, Boolean(config.dashboard?.includePrivateText)),
-    dreamCloud: buildDreamCloud(
-      state,
-      Boolean(config.dashboard?.includePrivateText),
-      generatedAt,
-      topDrives,
-    ),
     dreams: projectedDreams(
       state,
       Boolean(config.dashboard?.includePrivateText),

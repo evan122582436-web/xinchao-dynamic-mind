@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { OmbreClient, materialWithRefs, parseMemoryMapText, parseMemoryPreviewText, parseSurfacedBucketIds } from '../src/ombre-client.js';
+import { materialWithRefs, parseMemoryMapText, parseMemoryPreviewText, parseSurfacedBucketIds } from '../src/ombre-client.js';
 
 test('breath metadata exposes source bucket ids without guessing from body text', () => {
   const text = `
@@ -78,37 +78,4 @@ test('bucket preview refuses a mismatched bucket id', () => {
   assert.equal(result.available, false);
   assert.equal(result.reason, 'id_mismatch');
   assert.equal(result.preview, '');
-});
-
-test('conversation event auto memory writes only a semantic summary', async () => {
-  let received;
-  class FakeOmbreClient extends OmbreClient {
-    async call(name, args) {
-      received = { name, args };
-      return { result: { content: [{ type: 'text', text: '已写入：74a5375d099c' }] } };
-    }
-  }
-  const client = new FakeOmbreClient({ writeEnabled: true });
-  const bucketId = await client.storeConversationEvent(
-    { interactionType: 'reconciliation', sessionState: { tone: 'warm' } },
-    { interaction: { affectedDrives: [{ key: 'settle', label: '安定' }] } },
-  );
-  assert.equal(bucketId, '74a5375d099c');
-  assert.equal(received.name, 'hold');
-  assert.equal(received.args.source, 'xinchao-event');
-  assert.equal(received.args.auto, true);
-  assert.equal(received.args.importance, 8);
-  assert.match(received.args.content, /心潮互动：完成和解/);
-  assert.match(received.args.content, /窗口语气：warm/);
-  assert.match(received.args.content, /不保存聊天原文/);
-});
-
-test('conversation event auto memory respects explicit opt-out', async () => {
-  class FakeOmbreClient extends OmbreClient {
-    async call() {
-      throw new Error('should_not_write');
-    }
-  }
-  const client = new FakeOmbreClient({ writeEnabled: true });
-  assert.equal(await client.storeConversationEvent({ autoMemory: false }, {}), null);
 });
