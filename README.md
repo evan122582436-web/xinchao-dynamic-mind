@@ -66,6 +66,7 @@
 - 面向网页 AI、本地 Agent、手机网页与自建后端的接入清单；
 - 独立 Dashboard 口令换取 HttpOnly 会话，浏览器无需接触 `SERVICE_TOKEN`；状态投影只读，小屋仅开放明确的留言、锁与账本写入；
 - 独立 [`Wake Bridge`](packages/wake-bridge/) 消息信封协议，为梦境余韵、思念内容和自主行动结果预留用户/AI 双通道。
+- 固定到仓库内的 [`Runtime Bridge`](packages/runtime-bridge/) 0.4.x，用于把 `/bridge/v1/*` 队列投递到用户自己的前端、Agent 或 webhook。
 
 接口、环境变量和前端示例见 [可视化与多终端接入地基](docs/DASHBOARD-INTEGRATION.md)。视觉主题、花瓣与梦境星云可以独立迭代，不需要重写服务端。
 
