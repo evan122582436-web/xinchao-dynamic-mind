@@ -96,6 +96,7 @@ jobs:
           upsert_env LOCAL_MEMORY_ENABLED true
           upsert_env LOCAL_MEMORY_PATH /app/state/local-memory.jsonl
           upsert_env LOCAL_MEMORY_MAX_SUMMARY_CHARS 800
+          upsert_env INTERACTION_CLASSIFY_MIN_MINUTES 0
           if grep -Eqi '^OMBRE_READ_ENABLED=(1|true|yes|on)$' .env; then
             upsert_env CONTEXT_OMBRE_ENABLED true
           fi
