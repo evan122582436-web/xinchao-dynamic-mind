@@ -894,14 +894,17 @@ async function classifyExchange(event, source = 'api') {
   event.cause = String(event.cause ?? '').replace(/\s+/g, ' ').trim().slice(0, 60) || undefined;
   const exchange = String(event.exchange ?? '').replace(/\s+/g, ' ').trim().slice(0, 1500);
   delete event.exchange;
-  if (event.interactionType || !exchange || !config.model.enabled) return null;
+  if (event.interactionType) return { skipped: 'type_supplied' };
+  if (!exchange) return { skipped: 'no_exchange' };
+  if (!config.model.enabled) return { skipped: 'model_disabled' };
+  if (!config.model.apiKey) return { skipped: 'model_not_configured' };
   const snapshot = await store.read();
   const minMinutes = Number(config.interaction?.classifyMinMinutes ?? 0);
   const lastAt = Date.parse(snapshot.interactionClassifyAt ?? '');
   if (minMinutes > 0 && Number.isFinite(lastAt) && Date.now() - lastAt < minMinutes * 60_000) return { skipped: 'throttled' };
   try {
     const tag = await model.classifyInteraction(exchange);
-    if (!tag) return null;
+    if (!tag) return { skipped: 'model_not_configured' };
     event.interactionType = tag.type;
     event.sessionState = { ...(event.sessionState ?? event.session_state ?? {}), tone: tag.tone, warmth: tag.warmth, tension: tag.tension };
     if (tag.remember && !String(event.contextSummary ?? event.context_summary ?? '').trim()) {
@@ -918,7 +921,10 @@ async function classifyExchange(event, source = 'api') {
       (current) => ({ ...current, interactionClassifyAt: new Date().toISOString() }));
     log('interaction_classified', { type: tag.type, tone: tag.tone, remembered: Boolean(event.contextSummary), source });
     return { type: tag.type, tone: tag.tone, remembered: Boolean(event.contextSummary) };
-  } catch (error) { log('interaction_classify_failed', { message: error.message }); return null; }
+  } catch (error) {
+    log('interaction_classify_failed', { message: error.message });
+    return { error: 'model_request_failed' };
+  }
 }
 
 async function recordConversationEvent(event, source = 'api', now = new Date()) {
@@ -1612,7 +1618,7 @@ const server = createServer(async (request, response) => {
       const source = url.pathname === '/v1/heartbeat' ? 'heartbeat' : 'api';
       const classified = source === 'heartbeat' ? null : await classifyExchange(event, 'api');
       const result = await recordConversationEvent(event, source);
-      return send(response, 200, classified?.type ? { ...result, classified } : result);
+      return send(response, 200, classified ? { ...result, classified } : result);
     }
     if (request.method === 'POST' && url.pathname === '/v1/handoff-note') {
       const payload = await body(request);
