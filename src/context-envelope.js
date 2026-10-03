@@ -198,6 +198,7 @@ export function buildContextEnvelope({
   state,
   sessionId,
   mode = 'session_start',
+  localMemoryText = '',
   ombreText = '',
   maxTokens = 2200,
   ttlMinutes = 15,
@@ -296,6 +297,15 @@ export function buildContextEnvelope({
       content: handoffText,
     });
   }
+  const localContinuity = compact(localMemoryText);
+  if (localContinuity) {
+    sections.push({
+      id: 'local_continuity',
+      source: 'xinchao-local-memory',
+      ttl: 'session-start',
+      content: localContinuity,
+    });
+  }
   const continuity = compact(ombreText);
   if (continuity) {
     sections.push({
@@ -321,6 +331,7 @@ export function buildContextEnvelope({
     self_awareness: '自我觉察候选（我最近的样子，不一定对）',
     while_away: '你不在的时候（心潮记下的我自己的信号）',
     handoff_notes: '近期交接便签（非原文）',
+    local_continuity: '近期共同经历（脱水摘要）',
     dream_residue: '梦境余韵',
     recent_continuity: '近期连续性（不替代基岩）',
   };

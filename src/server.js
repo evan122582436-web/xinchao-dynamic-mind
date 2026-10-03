@@ -14,7 +14,7 @@ import { OmbreClient, parseSurfacedDomains } from './ombre-client.js';
 import { BarkClient } from './bark-client.js';
 import { readOmbreHeartbeat } from './heartbeat-store.js';
 import { buildContextEnvelope, contextDeliveryState, recordContextDelivery, buildNowCompact } from './context-envelope.js';
-import { TransitionJournal } from './transition-journal.js';
+import { TransitionJournal, summarizeTransition } from './transition-journal.js';
 import { handleMcpMessage } from './mcp-protocol.js';
 import { OAuthProvider } from './oauth-provider.js';
 import { recordHandoffNote } from './handoff-notes.js';
@@ -26,6 +26,7 @@ import { boardEnabled, postBoardMessage, readBoardMessages } from './board-clien
 import { SYSTEM_VERSION } from './version.js';
 import { memoryConnectionState } from './connection-diagnostics.js';
 import { PersonalityStore, computePersonalityStats } from './personality-store.js';
+import { LocalMemoryStore } from './local-memory-store.js';
 
 // 情绪 → 记忆：只在开关打开时把此刻情绪坐标交给 OB 做共振排序。
 function emotionForOmbre(state) {
@@ -57,6 +58,7 @@ const dashboardAuth = new DashboardAuth({
 const bridgeQueue = new BridgeQueue(config.bridge.statePath, config.bridge);
 const cabin = new CabinStore(config.cabin.statePath, config.cabin);
 const personality = new PersonalityStore(config.personalityPath);
+const localMemory = new LocalMemoryStore(config.memory.path, config.memory);
 const bridgeStreams = new Set();
 await oauth.init();
 let cyclePromise = null;
@@ -773,8 +775,24 @@ async function createContextEnvelope({
 }) {
   let state = await store.read();
   const delivery = contextDeliveryState(state, sessionId, mode, now, config.context.handoffOnceHours);
+  let localMemoryText = '';
   let ombreText = '';
-  let ombreWarning = '';
+  const warnings = [];
+  if (
+    mode === 'session_start'
+    && (!delivery.alreadyDelivered || force)
+    && config.memory.enabled
+  ) {
+    try {
+      const items = await localMemory.recent({ limit: 6 });
+      localMemoryText = items
+        .map((item) => `${item.createdAt}｜${item.kind}｜${item.summary}`)
+        .join('\n');
+    } catch (error) {
+      warnings.push('local_memory_unavailable');
+      log('context_local_memory_read_failed', { message: error.message });
+    }
+  }
   if (
     mode === 'session_start'
     && (!delivery.alreadyDelivered || force)
@@ -784,7 +802,7 @@ async function createContextEnvelope({
     try {
       ombreText = await ombre.recentContinuityMaterial(config.context.ombreMaxTokens, emotionForOmbre(state));
     } catch (error) {
-      ombreWarning = 'ombre_unavailable';
+      warnings.push('ombre_unavailable');
       log('context_ombre_read_failed', { message: error.message });
     }
   }
@@ -812,6 +830,7 @@ async function createContextEnvelope({
     boxSurfaced,
     awaySignals,
     cabinRecent,
+    localMemoryText,
     ombreText,
     maxTokens,
     ttlMinutes: config.context.ttlMinutes,
@@ -863,7 +882,7 @@ async function createContextEnvelope({
   } catch (error) {
     log('context_audit_failed', { message: error.message });
   }
-  return ombreWarning ? { ...envelope, warnings: [ombreWarning] } : envelope;
+  return warnings.length ? { ...envelope, warnings } : envelope;
 }
 
 // 没填类型但给了 exchange（她的一句 + 他的一段）→ 服务端替接收端判互动类型和氛围。
@@ -897,6 +916,7 @@ async function classifyExchange(event, source = 'api') {
 
 async function recordConversationEvent(event, source = 'api', now = new Date()) {
   let applied;
+  let eventBefore = {};
   const auditDetails = {};
   const driveBias = await personality.getDriveBias(now);
   const state = await updateState({
@@ -907,6 +927,7 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
     details: auditDetails,
     at: now,
   }, (current) => {
+    eventBefore = structuredClone(current);
     applied = settleAndApplyConversationEvent(current, event, now, {
       sleepAfterMinutes: config.sleepAfterMinutes,
       settle: { ...config.settle, driveBias },
@@ -924,6 +945,69 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
     });
     return applied.state;
   });
+
+  const localAutoMemory = {
+    attempted: false,
+    ok: false,
+    id: null,
+    duplicate: false,
+    error: null,
+  };
+  const ombreAutoMemory = {
+    attempted: false,
+    ok: false,
+    bucketId: null,
+    error: null,
+  };
+  const hasMemorySignal = source !== 'heartbeat' && Boolean(
+    String(event.contextSummary ?? event.context_summary ?? '').trim()
+    || String(event.interactionType ?? event.interaction_type ?? '').trim()
+    || Object.keys(event.sessionState ?? event.session_state ?? {}).length
+  );
+
+  if (config.memory.enabled && !applied.duplicate && hasMemorySignal && event?.autoMemory !== false) {
+    localAutoMemory.attempted = true;
+    try {
+      const written = await localMemory.writeConversationEvent(event, applied, { source }, now);
+      localAutoMemory.ok = Boolean(written.item);
+      localAutoMemory.id = written.item?.id ?? null;
+      localAutoMemory.duplicate = Boolean(written.duplicate);
+      if (written.item) {
+        log('local_memory_event_written', {
+          id: auditEventFingerprint(written.item.id),
+          kind: written.item.kind,
+          duplicate: Boolean(written.duplicate),
+        });
+      }
+    } catch (error) {
+      localAutoMemory.error = String(error.message ?? error).slice(0, 200);
+      log('local_memory_event_write_failed', {
+        interaction: applied.interaction?.type ?? null,
+        message: error.message,
+      });
+    }
+  }
+
+  if (config.ombre.eventWriteEnabled && !config.shadowMode && !applied.duplicate && hasMemorySignal && event?.autoMemory !== false) {
+    ombreAutoMemory.attempted = true;
+    try {
+      const bucketId = await ombre.storeConversationEvent(event, applied);
+      ombreAutoMemory.ok = Boolean(bucketId);
+      ombreAutoMemory.bucketId = bucketId;
+      log('ombre_event_written', {
+        bucket: bucketId ? auditEventFingerprint(bucketId) : null,
+        interaction: applied.interaction?.type ?? null,
+        accepted: Boolean(bucketId),
+      });
+    } catch (error) {
+      ombreAutoMemory.error = String(error.message ?? error).slice(0, 200);
+      log('ombre_event_write_failed', {
+        interaction: applied.interaction?.type ?? null,
+        message: error.message,
+      });
+    }
+  }
+
   return {
     revision: state.revision,
     consciousness: state.consciousness,
@@ -933,6 +1017,14 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
     duplicate: applied.duplicate,
     interaction: applied.interaction,
     settledHours: Number(applied.settled.elapsedHours.toFixed(4)),
+    observedAt: now.toISOString(),
+    stateDelta: summarizeTransition(eventBefore, state),
+    emotionBefore: emotionSummary(eventBefore, now),
+    emotionAfter: emotionSummary(state, now),
+    autoMemory: {
+      local: localAutoMemory,
+      ombre: ombreAutoMemory,
+    },
   };
 }
 
@@ -1361,8 +1453,17 @@ const server = createServer(async (request, response) => {
             duplicate: result.duplicate,
             interaction: result.interaction,
             settledHours: result.settledHours,
+            observedAt: result.observedAt,
+            stateDelta: result.stateDelta,
+            emotionBefore: result.emotionBefore,
+            emotionAfter: result.emotionAfter,
+            autoMemory: result.autoMemory,
           };
         },
+        memoryWrite: async (input) => localMemory.write(input),
+        memoryRecent: async (input) => localMemory.recent(input),
+        memorySearch: async (input) => localMemory.search(input),
+        memoryForget: async ({ id, reason }) => localMemory.forget(id, reason),
         handoffNote: async (note) => saveHandoffNote(note, 'mcp'),
         awareness: async (input) => handleAwareness(input),
         box: async (input) => handleBox(input),
@@ -1421,6 +1522,44 @@ const server = createServer(async (request, response) => {
 
     if (request.method === 'GET' && url.pathname === '/v1/state') {
       return send(response, 200, await store.read());
+    }
+    if (url.pathname === '/v1/memories') {
+      if (request.method === 'GET') {
+        return send(response, 200, {
+          memories: await localMemory.recent({
+            limit: url.searchParams.get('limit') ?? 10,
+            kind: url.searchParams.get('kind') ?? '',
+          }),
+        });
+      }
+      if (request.method === 'POST') {
+        const payload = await body(request);
+        return send(response, 201, await localMemory.write({
+          kind: payload.kind,
+          title: payload.title,
+          summary: payload.summary,
+          tags: payload.tags,
+          salience: payload.salience,
+          source: 'api',
+          sourceEventId: payload.source_event_id ?? payload.sourceEventId,
+          sessionId: payload.session_id ?? payload.sessionId,
+        }));
+      }
+      return send(response, 405, { error: 'method not allowed' }, { Allow: 'GET, POST' });
+    }
+    if (url.pathname === '/v1/memories/search') {
+      if (request.method !== 'GET') return send(response, 405, { error: 'method not allowed' }, { Allow: 'GET' });
+      return send(response, 200, {
+        memories: await localMemory.search({
+          query: url.searchParams.get('q') ?? url.searchParams.get('query') ?? '',
+          limit: url.searchParams.get('limit') ?? 10,
+          kind: url.searchParams.get('kind') ?? '',
+        }),
+      });
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/memories/forget') {
+      const payload = await body(request);
+      return send(response, 200, await localMemory.forget(payload.id, payload.reason));
     }
     if (request.method === 'GET' && url.pathname === '/v1/breath-context') {
       const state = await store.read();

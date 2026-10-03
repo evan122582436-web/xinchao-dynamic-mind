@@ -29,6 +29,11 @@ export function loadConfig() {
     settleIntervalMinutes: number('SETTLE_INTERVAL_MINUTES', 15, 1, 1440),
     sleepAfterMinutes: number('SLEEP_AFTER_MINUTES', 90, 5, 10080),
     shadowMode: bool('SHADOW_MODE', true),
+    memory: {
+      enabled: bool('LOCAL_MEMORY_ENABLED', true),
+      path: process.env.LOCAL_MEMORY_PATH ?? '/app/state/local-memory.jsonl',
+      maxSummaryChars: number('LOCAL_MEMORY_MAX_SUMMARY_CHARS', 800, 120, 2000),
+    },
     model: {
       enabled: bool('MODEL_ENABLED', false),
       baseUrl: (process.env.MODEL_BASE_URL ?? 'http://127.0.0.1:11434/v1').replace(/\/$/, ''),
@@ -49,6 +54,9 @@ export function loadConfig() {
       token: process.env.OMBRE_MCP_TOKEN ?? '',
       readEnabled: bool('OMBRE_READ_ENABLED', false),
       writeEnabled: bool('OMBRE_WRITE_ENABLED', false),
+      // Durable local memory is always written first. This optional second leg
+      // promotes meaningful event summaries into the shared semantic OB store.
+      eventWriteEnabled: bool('OMBRE_EVENT_WRITE_ENABLED', bool('OMBRE_WRITE_ENABLED', false)),
       breathMaxResults: number('OMBRE_BREATH_MAX_RESULTS', 3, 1, 10),
       breathMaxTokens: number('OMBRE_BREATH_MAX_TOKENS', 800, 200, 3000),
       // 3.3：把此刻情绪坐标带给 breath（共振排序）和没自带坐标的 hold（情感标签）。
@@ -216,8 +224,14 @@ export function validateConfig(config) {
   const externalMemoryEnabled = Boolean(
     config.ombre.readEnabled
     || config.ombre.writeEnabled
+    || config.ombre.eventWriteEnabled
     || config.context.ombreEnabled
   );
+  if (config.ombre.eventWriteEnabled && !config.ombre.writeEnabled) {
+    throw new Error(
+      'OMBRE_WRITE_ENABLED=true is required when OMBRE_EVENT_WRITE_ENABLED is enabled'
+    );
+  }
   if (externalMemoryEnabled) {
     if (!String(config.ombre.url || '').trim()) {
       throw new Error(

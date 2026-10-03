@@ -84,13 +84,23 @@ jobs:
             echo 'Missing .env in deploy path'
             exit 1
           fi
-          if ! grep -q '^LOCAL_MEMORY_ENABLED=' .env; then
-            {
-              printf '\n'
-              printf '%s\n' 'LOCAL_MEMORY_ENABLED=true'
-              printf '%s\n' 'LOCAL_MEMORY_PATH=/app/state/local-memory.jsonl'
-              printf '%s\n' 'LOCAL_MEMORY_MAX_SUMMARY_CHARS=800'
-            } >> .env
+          upsert_env() {
+            key="$1"
+            value="$2"
+            if grep -q "^${key}=" .env; then
+              sed -i "s|^${key}=.*|${key}=${value}|" .env
+            else
+              printf '%s=%s\n' "$key" "$value" >> .env
+            fi
+          }
+          upsert_env LOCAL_MEMORY_ENABLED true
+          upsert_env LOCAL_MEMORY_PATH /app/state/local-memory.jsonl
+          upsert_env LOCAL_MEMORY_MAX_SUMMARY_CHARS 800
+          if grep -Eqi '^OMBRE_READ_ENABLED=(1|true|yes|on)$' .env; then
+            upsert_env CONTEXT_OMBRE_ENABLED true
+          fi
+          if grep -Eqi '^OMBRE_WRITE_ENABLED=(1|true|yes|on)$' .env; then
+            upsert_env OMBRE_EVENT_WRITE_ENABLED true
           fi
           sudo docker compose up -d --build
           sudo docker compose ps

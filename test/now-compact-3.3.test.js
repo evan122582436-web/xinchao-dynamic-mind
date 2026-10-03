@@ -109,3 +109,20 @@ test('while_away section lists undelivered self signals and cabin line counts re
   assert.deepEqual(away.data.ids, ['d1']);
   assert.match(envelope.sections[0].content, /小屋 24 小时内有 2 条她的来信/);
 });
+
+test('session-start envelope includes durable local continuity before optional OB continuity', () => {
+  const state = baseState();
+  const envelope = buildContextEnvelope({
+    state,
+    sessionId: 's1',
+    now: at(0),
+    localMemoryText: '2026-10-03｜tech｜共享记忆链已经修复。',
+    ombreText: 'OB 里的长期语义记忆。',
+  });
+  const localIndex = envelope.sections.findIndex((section) => section.id === 'local_continuity');
+  const ombreIndex = envelope.sections.findIndex((section) => section.id === 'recent_continuity');
+  assert.ok(localIndex > -1);
+  assert.ok(ombreIndex > localIndex);
+  assert.match(envelope.additionalContext, /近期共同经历（脱水摘要）/);
+  assert.match(envelope.additionalContext, /共享记忆链已经修复/);
+});

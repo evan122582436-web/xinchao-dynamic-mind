@@ -326,6 +326,36 @@ export class OmbreClient {
     return linked;
   }
 
+  async storeConversationEvent(event = {}, result = {}) {
+    if (!this.config.writeEnabled) throw new Error('ombre_write_disabled');
+    if (event?.autoMemory === false) return null;
+    const interactionType = String(event.interactionType ?? event.interaction_type ?? '').trim();
+    const tone = String(event.sessionState?.tone ?? event.tone ?? '').trim();
+    const contextSummary = String(event.contextSummary ?? event.context_summary ?? '')
+      .replace(/\s+/g, ' ').trim().slice(0, 800);
+    const affected = (result.interaction?.affectedDrives ?? [])
+      .map((item) => typeof item === 'string' ? item : (item?.label ?? item?.key))
+      .filter(Boolean)
+      .slice(0, 4)
+      .join('、');
+    if (!interactionType && !contextSummary && !tone && !affected) return null;
+    const lines = [
+      `心潮互动：${interactionLabel(interactionType)}`,
+      contextSummary ? `上下文摘要：${contextSummary}` : '',
+      tone ? `窗口语气：${tone}` : '',
+      affected ? `影响维度：${affected}` : '',
+      '说明：这是心潮自动沉淀的脱水摘要，不保存聊天原文。',
+    ].filter(Boolean);
+    const payload = await this.call('hold', {
+      content: lines.join('\n'),
+      tags: 'xinchao,event,interaction',
+      importance: eventImportance(interactionType),
+      auto: true,
+      source: 'xinchao-event',
+    });
+    return extractText(payload).match(/[a-f0-9]{12,}/i)?.[0] ?? null;
+  }
+
   async storeDream(dream) {
     if (!this.config.writeEnabled) return null;
     const content = [
@@ -351,6 +381,27 @@ export class OmbreClient {
     }
     return bucketId;
   }
+}
+
+function interactionLabel(type) {
+  return ({
+    companionship: '陪伴交流',
+    affection: '明确关心安抚',
+    intimacy: '明确亲密互动',
+    sharing: '完成分享',
+    discovery: '共同探索',
+    task_progress: '推进任务',
+    reflection: '完成沉淀',
+    conflict: '发生冲突',
+    loss: '经历失落',
+    reconciliation: '完成和解',
+  })[type] ?? (type || '一次真实互动');
+}
+
+function eventImportance(type) {
+  if (['conflict', 'loss', 'reconciliation', 'reflection'].includes(type)) return 8;
+  if (['intimacy', 'discovery', 'task_progress'].includes(type)) return 7;
+  return 6;
 }
 
 // 把当前最强的几个驱动力拼进 breath 的 query，让"此刻想什么"影响"想起什么"。

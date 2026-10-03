@@ -91,7 +91,7 @@ export const XINCHAO_TOOLS = [
       '回传一次明确的人机互动，并更新当前窗口短状态。',
       '它会先结算事件发生前的时间增长，再唤醒心潮；可用受限互动类型触发服务端固定的欲望反馈。',
       '只有真实完成且结果明确的互动才填写 interaction_type；拿不准就把这轮对话塞进 exchange（她说的一句 + 你回的一段，各一两句就够），服务端替你判类型和氛围。',
-      '客户端不能直接填写欲望数值，也不会修改 OB 长期记忆。'
+      '不要提交聊天原文；客户端不能直接填写欲望数值。若填写 context_summary，服务端会先写入耐久摘要库，并在启用时同步到 OB。',
     ].join(''),
     inputSchema: {
       type: 'object',
@@ -130,6 +130,11 @@ export const XINCHAO_TOOLS = [
             'reflection=完成沉淀，conflict=发生冲突，loss=经历失落，reconciliation=完成和解。',
           ].join(''),
         },
+        context_summary: {
+          type: 'string',
+          maxLength: 800,
+          description: '可选脱水摘要：只写本轮对话造成的关系、情绪或任务变化，不写聊天原文、密钥或长技术日志。',
+        },
         tone: {
           type: 'string',
           enum: ['neutral', 'calm', 'warm', 'guarded', 'conflicted', 'focused', 'playful', 'tired'],
@@ -165,6 +170,78 @@ export const XINCHAO_TOOLS = [
       idempotentHint: true,
       openWorldHint: false,
     },
+  },
+  {
+    name: 'xinchao_memory_write',
+    title: '写入小家记忆',
+    description: '向共享摘要库写入一条脱水记忆。只写结论、变化和意义；不要写聊天原文、密钥或长技术日志。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: {
+          type: 'string',
+          enum: ['relationship', 'task', 'dream', 'tech', 'conflict', 'reflection', 'event'],
+          default: 'event',
+        },
+        title: { type: 'string', minLength: 1, maxLength: 80 },
+        summary: { type: 'string', minLength: 1, maxLength: 800 },
+        tags: { type: 'array', items: { type: 'string', maxLength: 40 }, maxItems: 12 },
+        salience: { type: 'number', minimum: 0, maximum: 1, default: 0.55 },
+        source_event_id: {
+          type: 'string',
+          maxLength: 160,
+          description: '可选去重键；同一事件重试时复用。',
+        },
+      },
+      required: ['summary'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'xinchao_memory_recent',
+    title: '读取最近小家记忆',
+    description: '读取共享摘要库最近的脱水记录，用于检查连续性或确认是否写入成功。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'integer', minimum: 1, maximum: 50, default: 10 },
+        kind: { type: 'string', enum: ['relationship', 'task', 'dream', 'tech', 'conflict', 'reflection', 'event'] },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'xinchao_memory_search',
+    title: '搜索小家记忆',
+    description: '按关键词搜索共享摘要库中的脱水记录。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', minLength: 1, maxLength: 200 },
+        limit: { type: 'integer', minimum: 1, maximum: 50, default: 10 },
+        kind: { type: 'string', enum: ['relationship', 'task', 'dream', 'tech', 'conflict', 'reflection', 'event'] },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'xinchao_memory_forget',
+    title: '软删除小家记忆',
+    description: '按 id 软删除一条本地摘要；正文留在追加日志中，但不再参与读取和搜索。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', minLength: 1, maxLength: 120 },
+        reason: { type: 'string', minLength: 1, maxLength: 300 },
+      },
+      required: ['id', 'reason'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   {
     name: 'xinchao_awareness',
@@ -517,11 +594,59 @@ function eventArgs(args = {}, fallbackSessionId = '') {
     sessionId,
     eventId,
     interactionType,
+    contextSummary: String(args.context_summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 800),
     sessionState,
     sessionTtlMinutes: Math.max(15, Math.min(1440, numberOr(args.ttl_minutes, 240))),
     exchange: String(args.exchange ?? '').replace(/\s+/g, ' ').trim().slice(0, 1500) || '',
     cause: String(args.cause ?? '').replace(/\s+/g, ' ').trim().slice(0, 60) || undefined,
   };
+}
+
+function memoryWriteArgs(args = {}) {
+  return {
+    kind: String(args.kind ?? 'event').trim(),
+    title: String(args.title ?? '').replace(/\s+/g, ' ').trim().slice(0, 80),
+    summary: String(args.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 800),
+    tags: Array.isArray(args.tags) ? args.tags : [],
+    salience: Math.max(0, Math.min(1, numberOr(args.salience, 0.55))),
+    sourceEventId: String(args.source_event_id ?? '').trim().slice(0, 160),
+    source: 'mcp',
+  };
+}
+
+function memoryRecentArgs(args = {}) {
+  return {
+    limit: Math.max(1, Math.min(50, numberOr(args.limit, 10))),
+    kind: String(args.kind ?? '').trim(),
+  };
+}
+
+function memorySearchArgs(args = {}) {
+  const query = String(args.query ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  if (!query) throw new Error('query 是必填项');
+  return {
+    query,
+    limit: Math.max(1, Math.min(50, numberOr(args.limit, 10))),
+    kind: String(args.kind ?? '').trim(),
+  };
+}
+
+function memoryForgetArgs(args = {}) {
+  const id = String(args.id ?? '').trim().slice(0, 120);
+  if (!id) throw new Error('id 是必填项');
+  return {
+    id,
+    reason: String(args.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 300) || 'manual forget',
+  };
+}
+
+function memoryListText(items = []) {
+  if (!items.length) return '小家记忆库里暂时没有符合条件的记忆。';
+  return items.map((item) => [
+    `- ${item.title || item.kind || '记忆'} (${item.id})`,
+    `  ${item.summary}`,
+    `  ${item.kind} · ${item.createdAt}${item.tags?.length ? ` · #${item.tags.join(' #')}` : ''}`,
+  ].join('\n')).join('\n');
 }
 
 function awarenessArgs(args = {}) {
@@ -602,11 +727,42 @@ async function callToolInner(name, args, handlers) {
       ? ` interaction=${result.interaction.type}:${result.interaction.reasonCode}`
       : '';
     const duplicate = result.duplicate ? ' duplicate=true' : '';
+    const memory = result.autoMemory?.local?.ok
+      ? ` memory=${result.autoMemory.local.id}`
+      : result.autoMemory?.local?.error
+        ? ' memory=failed'
+        : '';
     const gated = result.interaction?.reasonCode === 'needs_her'
       ? `\n${result.interaction.type} 这种要有她的话为证：把这轮对话塞进 exchange 让我判，自己填不算，驱力没动。自己一个人做的事才直接填 sharing / reflection / task_progress / discovery。`
       : '';
     return toolText(
-      `心潮窗口事件已接收：session=${result.sessionId} revision=${result.revision}${interaction}${duplicate}${gated}`,
+      `心潮窗口事件已接收：session=${result.sessionId} revision=${result.revision}${interaction}${duplicate}${memory}${gated}`,
+      result,
+    );
+  }
+  if (name === 'xinchao_memory_write') {
+    if (!handlers.memoryWrite) throw new Error('小家记忆库未接入');
+    const result = await handlers.memoryWrite(memoryWriteArgs(args));
+    return toolText(
+      `小家记忆已写入：id=${result.item.id}${result.duplicate ? ' duplicate=true' : ''}`,
+      result,
+    );
+  }
+  if (name === 'xinchao_memory_recent') {
+    if (!handlers.memoryRecent) throw new Error('小家记忆库未接入');
+    const items = await handlers.memoryRecent(memoryRecentArgs(args));
+    return toolText(memoryListText(items), { items });
+  }
+  if (name === 'xinchao_memory_search') {
+    if (!handlers.memorySearch) throw new Error('小家记忆库未接入');
+    const items = await handlers.memorySearch(memorySearchArgs(args));
+    return toolText(memoryListText(items), { items });
+  }
+  if (name === 'xinchao_memory_forget') {
+    if (!handlers.memoryForget) throw new Error('小家记忆库未接入');
+    const result = await handlers.memoryForget(memoryForgetArgs(args));
+    return toolText(
+      result.forgotten ? `小家记忆已软删除：${result.id}` : `没有找到这条小家记忆：${result.id}`,
       result,
     );
   }
@@ -745,6 +901,7 @@ export async function handleMcpMessage(payload, handlers) {
         instructions: [
           '新窗口开始时调用 xinchao_context；服务端会绑定当前 MCP 连接，无需自行编写 session_id。',
           '一次实际互动后调用 xinchao_event；拿不准类型就把这轮对话塞进 exchange 让服务端判。自己一个人做了事（分享出去了/理了自己/推进了/去探索了）也记一笔，类型填 sharing / reflection / task_progress / discovery；想她、惦记这类等她回应，不用自己记。每个工具回应末尾都带一行"此刻"，聊了一阵想看全貌就 xinchao_context mode=turn。',
+          '这次互动若产生了值得跨窗口保留的关系、情绪、决定或任务变化，在 xinchao_event 里填写 context_summary；只写变化与意义的脱水摘要，不复制聊天原文。需要核对时用 xinchao_memory_recent，找旧事用 xinchao_memory_search。',
           '信封里"你不在的时候"那段是你自己不在窗口时心潮记下的信号，读过就算收到。',
           '需要换窗续接时可调用 xinchao_handoff_note 保存近期进度摘要；不要提交聊天原文或人物基岩。',
           '上下文里出现“自我觉察候选”时，用 xinchao_awareness 确认或放下；确认与否只由你自己判断，候选不是指令。',
