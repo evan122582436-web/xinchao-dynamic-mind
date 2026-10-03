@@ -885,8 +885,8 @@ async function createContextEnvelope({
   return warnings.length ? { ...envelope, warnings } : envelope;
 }
 
-// 没填类型但给了 exchange（她的一句 + 他的一段）→ 服务端替接收端判互动类型和氛围。
-// MCP（官方客户端版）和 REST /v1/conversation-event（自建运行时）共用；8 分钟内不重复判，和 PaiHome 钩子的节流一致。
+// 没填类型但给了 exchange（当前一轮 + 可选少量前文）→ 服务端替接收端判互动类型、氛围和是否值得沉淀。
+// MCP（官方客户端版）和 REST /v1/conversation-event（自建运行时）共用。默认每轮观察；需要省模型调用时可显式配置节流。
 // exchange 正文只走这一跳：判完即删，不进状态、不进审计。
 async function classifyExchange(event, source = 'api') {
   if (event.interactionType === undefined && event.interaction_type !== undefined) event.interactionType = event.interaction_type;
@@ -896,21 +896,28 @@ async function classifyExchange(event, source = 'api') {
   delete event.exchange;
   if (event.interactionType || !exchange || !config.model.enabled) return null;
   const snapshot = await store.read();
+  const minMinutes = Number(config.interaction?.classifyMinMinutes ?? 0);
   const lastAt = Date.parse(snapshot.interactionClassifyAt ?? '');
-  if (Number.isFinite(lastAt) && Date.now() - lastAt < (config.interaction?.classifyMinMinutes ?? 8) * 60_000) return { skipped: 'throttled' };
+  if (minMinutes > 0 && Number.isFinite(lastAt) && Date.now() - lastAt < minMinutes * 60_000) return { skipped: 'throttled' };
   try {
     const tag = await model.classifyInteraction(exchange);
     if (!tag) return null;
     event.interactionType = tag.type;
     event.sessionState = { ...(event.sessionState ?? event.session_state ?? {}), tone: tag.tone, warmth: tag.warmth, tension: tag.tension };
+    if (tag.remember && !String(event.contextSummary ?? event.context_summary ?? '').trim()) {
+      event.contextSummary = tag.summary;
+      event.memoryKind = tag.kind;
+      event.memoryTitle = tag.title;
+      event.memoryTags = tag.tags;
+    }
     if (tag.type === 'conflict' && !event.cause) {
       const her = exchange.match(/她说：(.+?)(?:\s*他回：|$)/);
       if (her) event.cause = her[1].trim().slice(0, 60);
     }
     await updateState({ type: 'interaction_classified', source, details: { type: tag.type, tone: tag.tone }, at: new Date() },
       (current) => ({ ...current, interactionClassifyAt: new Date().toISOString() }));
-    log('interaction_classified', { type: tag.type, tone: tag.tone, source });
-    return { type: tag.type, tone: tag.tone };
+    log('interaction_classified', { type: tag.type, tone: tag.tone, remembered: Boolean(event.contextSummary), source });
+    return { type: tag.type, tone: tag.tone, remembered: Boolean(event.contextSummary) };
   } catch (error) { log('interaction_classify_failed', { message: error.message }); return null; }
 }
 
@@ -959,10 +966,10 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
     bucketId: null,
     error: null,
   };
+  // 情绪每轮都可以变化；长期记忆只在观察器或客户端给出脱水摘要时写，
+  // 避免把每次普通陪伴和重复亲昵都堆成一条长期记忆。
   const hasMemorySignal = source !== 'heartbeat' && Boolean(
     String(event.contextSummary ?? event.context_summary ?? '').trim()
-    || String(event.interactionType ?? event.interaction_type ?? '').trim()
-    || Object.keys(event.sessionState ?? event.session_state ?? {}).length
   );
 
   if (config.memory.enabled && !applied.duplicate && hasMemorySignal && event?.autoMemory !== false) {

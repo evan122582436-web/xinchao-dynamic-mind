@@ -53,3 +53,20 @@ test('conversation events write context_summary instead of raw state-only copy',
   assert.doesNotMatch(result.item.summary, /窗口语气/);
 });
 
+test('conversation observer metadata controls durable memory shape', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'xinchao-memory-'));
+  const memory = new LocalMemoryStore(join(dir, 'memory.jsonl'));
+  const result = await memory.writeConversationEvent({
+    eventId: 'observed-1',
+    interactionType: 'task_progress',
+    contextSummary: '媛媛与澄把自动观察装进了小家正在使用的聊天桥。',
+    memoryKind: 'tech',
+    memoryTitle: '聊天桥开始自动观察',
+    memoryTags: ['连接桥', '共享记忆'],
+  }, { interaction: { affectedDrives: ['duty'] } }, { source: 'api' });
+
+  assert.equal(result.item.kind, 'tech');
+  assert.equal(result.item.title, '聊天桥开始自动观察');
+  assert.ok(result.item.tags.includes('连接桥'));
+  assert.ok(result.item.tags.includes('共享记忆'));
+});

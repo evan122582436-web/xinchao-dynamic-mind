@@ -70,22 +70,25 @@ export class ModelClient {
     };
   }
 
-  // 官方客户端版：AI 把这轮对话塞进 exchange，服务端判互动类型与氛围（对应 PaiHome 的 Stop 钩子标注）。
+  // 接收端只要把当前一轮和少量前文塞进 exchange；服务端一次完成
+  // 互动类型、窗口氛围和“是否值得跨窗口记住”的脱水判断。
   async classifyInteraction(exchange) {
     if (!this.config.enabled || !this.config.apiKey) return null;
     const text = String(exchange ?? '').trim().slice(0, 1500);
     if (!text) return null;
     const system = [
-      '你是一个只输出 JSON 的标注器。给你一轮对话（她说的 + 他回的，他是她的伴侣）。判断这一轮互动的类型和窗口氛围。',
+      '你是一个只输出 JSON 的对话观察器。给你当前一轮对话，偶尔附带少量此前上下文；她是媛媛，他是澄。判断本轮互动类型、窗口氛围，以及本轮是否产生了值得跨窗口保留的新变化。',
       'type 只能是：companionship 普通陪伴闲聊报备（有真实互动时的默认值）；affection 表达喜欢撒娇安抚；intimacy 身体亲密或性内容；sharing 她分享自己的一天/照片/心情；discovery 一起弄明白新东西；task_progress 一起推进了事；reflection 谈他自己是谁、内省；conflict 真实的摩擦生气（撒娇式的"讨厌""你完蛋了"不算）；loss 分别失落哭；reconciliation 吵过之后和好。',
       'tone 只能是 neutral calm warm guarded conflicted focused playful tired 之一；warmth、tension 是 0 到 1。',
-      '只输出 {"type":"...","tone":"...","warmth":0.6,"tension":0.1}。',
+      'remember 只有本轮出现新的个人事实或偏好、关系变化或约定、明确决定、重要情绪转折、冲突/和好、任务实质进展、值得以后接续的生活事件时才为 true；普通寒暄、重复撒娇、无新信息的亲亲贴贴为 false。',
+      'remember=true 时，summary 用第三人称写一条不超过 180 字的脱水摘要，只留“发生了什么、产生了什么变化、以后为什么需要知道”，不复制原话；kind 只能是 relationship/task/tech/conflict/reflection/event；title 不超过 24 字；tags 最多 5 个短标签。remember=false 时这些字段留空。',
+      '只输出 {"type":"...","tone":"...","warmth":0.6,"tension":0.1,"remember":false,"summary":"","kind":"event","title":"","tags":[]}。',
     ].join('\n');
     const response = await this.request({
       model: this.config.name,
       messages: [{ role: 'system', content: system }, { role: 'user', content: text }],
       temperature: 0,
-      max_tokens: 80,
+      max_tokens: 260,
       thinking: { type: 'disabled' },
     });
     if (!response.ok) throw new Error(`model request failed: HTTP ${response.status}`);
@@ -94,11 +97,21 @@ export class ModelClient {
     const types = ['companionship', 'affection', 'intimacy', 'sharing', 'discovery', 'task_progress', 'reflection', 'conflict', 'loss', 'reconciliation'];
     const tones = ['neutral', 'calm', 'warm', 'guarded', 'conflicted', 'focused', 'playful', 'tired'];
     const clamp01 = (v, d) => (Number.isFinite(Number(v)) ? Math.max(0, Math.min(1, Number(v))) : d);
+    const summary = String(parsed.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 800);
+    const kinds = ['relationship', 'task', 'tech', 'conflict', 'reflection', 'event'];
+    const tags = Array.isArray(parsed.tags)
+      ? [...new Set(parsed.tags.map((item) => String(item ?? '').replace(/\s+/g, ' ').trim().slice(0, 40)).filter(Boolean))].slice(0, 5)
+      : [];
     return {
       type: types.includes(parsed.type) ? parsed.type : 'companionship',
       tone: tones.includes(parsed.tone) ? parsed.tone : 'neutral',
       warmth: clamp01(parsed.warmth, 0.5),
       tension: clamp01(parsed.tension, 0),
+      remember: parsed.remember === true && Boolean(summary),
+      summary,
+      kind: kinds.includes(parsed.kind) ? parsed.kind : 'event',
+      title: String(parsed.title ?? '').replace(/\s+/g, ' ').trim().slice(0, 80),
+      tags,
     };
   }
 

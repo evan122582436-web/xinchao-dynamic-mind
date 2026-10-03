@@ -162,10 +162,10 @@ export class LocalMemoryStore {
     const text = summary || fallback;
     if (!text) return { item: null, duplicate: false, skipped: true };
     return this.write({
-      kind: eventKind(interactionType, text),
-      title: eventTitle(interactionType, text),
+      kind: event.memoryKind ?? eventKind(interactionType, text),
+      title: event.memoryTitle ?? eventTitle(interactionType, text),
       summary: text,
-      tags: ['xinchao', 'event', interactionType].filter(Boolean),
+      tags: ['xinchao', 'event', interactionType, ...(Array.isArray(event.memoryTags) ? event.memoryTags : [])].filter(Boolean),
       salience: interactionType === 'task_progress' || summary ? 0.72 : 0.48,
       source: meta.source ?? 'event',
       sourceEventId: event.eventId ?? event.event_id,
@@ -220,4 +220,3 @@ export class LocalMemoryStore {
     return { forgotten: true, id: memoryIdValue };
   }
 }
-

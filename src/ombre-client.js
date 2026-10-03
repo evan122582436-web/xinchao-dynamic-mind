@@ -353,7 +353,7 @@ export class OmbreClient {
       content: lines.join('\n'),
       meaning,
       why_remembered: '由心潮事件自动提炼；只保留变化与意义，不保存聊天原文。',
-      tags: 'xinchao,event,interaction',
+      tags: ['xinchao', 'event', 'interaction', ...(Array.isArray(event.memoryTags) ? event.memoryTags : [])].filter(Boolean).join(','),
       importance: eventImportance(interactionType),
       auto: true,
       source: 'xinchao-event',
