@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { cleanSurfacedText, materialWithRefs } from '../src/ombre-client.js';
+import { cleanSurfacedText, materialWithRefs, OmbreClient } from '../src/ombre-client.js';
 
 test('archived buckets, budget notices and the ids json tail are dropped from surfaced material', () => {
   const raw = [
@@ -19,4 +19,24 @@ test('archived buckets, budget notices and the ids json tail are dropped from su
   assert.deepEqual(refs.bucketIds, ['4f4a37e2fe6b']);
   assert.ok(!refs.text.includes('潮汐星港'));
   assert.ok(refs.text.includes('她说门是可以拉开的'));
+});
+
+test('automatic conversation memory sends OB an explicit meaning and returns the bucket id', async () => {
+  let received;
+  class FakeOmbreClient extends OmbreClient {
+    async call(name, args) {
+      assert.equal(name, 'hold');
+      received = args;
+      return { result: { content: [{ type: 'text', text: '新建→8f8b6bf52e33 未分类' }] } };
+    }
+  }
+  const client = new FakeOmbreClient({ writeEnabled: true });
+  const id = await client.storeConversationEvent({
+    interactionType: 'task_progress',
+    contextSummary: '共享记忆链已经通过线上验收。',
+    sessionState: { tone: 'focused' },
+  }, { interaction: { affectedDrives: ['duty'] } });
+  assert.equal(id, '8f8b6bf52e33');
+  assert.match(received.meaning, /共享记忆链已经通过线上验收/);
+  assert.match(received.why_remembered, /不保存聊天原文/);
 });

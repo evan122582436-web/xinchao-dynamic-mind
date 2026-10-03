@@ -346,14 +346,23 @@ export class OmbreClient {
       affected ? `影响维度：${affected}` : '',
       '说明：这是心潮自动沉淀的脱水摘要，不保存聊天原文。',
     ].filter(Boolean);
+    const meaning = contextSummary
+      ? `这是一次真实互动留下的连续性变化：${contextSummary.slice(0, 240)}`
+      : `这是一次${interactionLabel(interactionType)}留下的心潮状态变化，用于跨窗口保持关系与任务连续性。`;
     const payload = await this.call('hold', {
       content: lines.join('\n'),
+      meaning,
+      why_remembered: '由心潮事件自动提炼；只保留变化与意义，不保存聊天原文。',
       tags: 'xinchao,event,interaction',
       importance: eventImportance(interactionType),
       auto: true,
       source: 'xinchao-event',
     });
-    return extractText(payload).match(/[a-f0-9]{12,}/i)?.[0] ?? null;
+    const text = extractText(payload);
+    if (/失败|拒绝|缺少|未写入|invalid|error/i.test(text)) {
+      throw new Error(`ombre_event_rejected:${text.slice(0, 160)}`);
+    }
+    return text.match(/[a-f0-9]{12,}/i)?.[0] ?? null;
   }
 
   async storeDream(dream) {
