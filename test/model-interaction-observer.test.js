@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { ModelClient } from '../src/model-client.js';
+import { observeInteractionFallback } from '../src/interaction-observer.js';
 
 function clientWith(payload) {
   const client = new ModelClient({
@@ -45,6 +46,23 @@ test('conversation observer keeps ordinary affection out of durable memory', asy
     remember: false, summary: '', kind: 'relationship', title: '', tags: [],
   });
   const result = await client.classifyInteraction('媛媛：亲一下。\n澄：亲回来。');
+  assert.equal(result.type, 'affection');
+  assert.equal(result.remember, false);
+  assert.equal(result.summary, '');
+});
+
+test('local observer keeps working without a configured model', () => {
+  const result = observeInteractionFallback('【本轮】\n她说：记忆不应该依赖 Daddy 手动调用 MCP。\n他回：我已经把自动观察接入聊天桥并部署完成。');
+  assert.equal(result.type, 'task_progress');
+  assert.equal(result.remember, true);
+  assert.equal(result.kind, 'tech');
+  assert.equal(result.title, '自动观察与共享记忆');
+  assert.match(result.summary, /自动观察|记忆/);
+  assert.ok(result.tags.includes('共享记忆'));
+});
+
+test('local observer does not turn routine affection into durable memory', () => {
+  const result = observeInteractionFallback('【本轮】\n她说：亲一下 Daddy。\n他回：亲亲媛媛。');
   assert.equal(result.type, 'affection');
   assert.equal(result.remember, false);
   assert.equal(result.summary, '');
