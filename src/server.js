@@ -27,6 +27,7 @@ import { SYSTEM_VERSION } from './version.js';
 import { memoryConnectionState } from './connection-diagnostics.js';
 import { PersonalityStore, computePersonalityStats } from './personality-store.js';
 import { LocalMemoryStore } from './local-memory-store.js';
+import { observeInteractionFallback } from './interaction-observer.js';
 
 // 情绪 → 记忆：只在开关打开时把此刻情绪坐标交给 OB 做共振排序。
 function emotionForOmbre(state) {
@@ -896,15 +897,25 @@ async function classifyExchange(event, source = 'api') {
   delete event.exchange;
   if (event.interactionType) return { skipped: 'type_supplied' };
   if (!exchange) return { skipped: 'no_exchange' };
-  if (!config.model.enabled) return { skipped: 'model_disabled' };
-  if (!config.model.apiKey) return { skipped: 'model_not_configured' };
   const snapshot = await store.read();
   const minMinutes = Number(config.interaction?.classifyMinMinutes ?? 0);
   const lastAt = Date.parse(snapshot.interactionClassifyAt ?? '');
   if (minMinutes > 0 && Number.isFinite(lastAt) && Date.now() - lastAt < minMinutes * 60_000) return { skipped: 'throttled' };
+  let observer = 'local';
+  let fallbackReason = config.model.enabled && config.model.apiKey ? null : 'model_not_configured';
+  let tag = null;
+  if (config.model.enabled && config.model.apiKey) {
+    try {
+      tag = await model.classifyInteraction(exchange);
+      if (tag) observer = 'model';
+    } catch (error) {
+      fallbackReason = 'model_request_failed';
+      log('interaction_classify_failed', { message: error.message });
+    }
+  }
+  tag ||= observeInteractionFallback(exchange);
+  if (!tag) return { skipped: 'empty_exchange' };
   try {
-    const tag = await model.classifyInteraction(exchange);
-    if (!tag) return { skipped: 'model_not_configured' };
     event.interactionType = tag.type;
     event.sessionState = { ...(event.sessionState ?? event.session_state ?? {}), tone: tag.tone, warmth: tag.warmth, tension: tag.tension };
     if (tag.remember && !String(event.contextSummary ?? event.context_summary ?? '').trim()) {
@@ -920,10 +931,10 @@ async function classifyExchange(event, source = 'api') {
     await updateState({ type: 'interaction_classified', source, details: { type: tag.type, tone: tag.tone }, at: new Date() },
       (current) => ({ ...current, interactionClassifyAt: new Date().toISOString() }));
     log('interaction_classified', { type: tag.type, tone: tag.tone, remembered: Boolean(event.contextSummary), source });
-    return { type: tag.type, tone: tag.tone, remembered: Boolean(event.contextSummary) };
+    return { type: tag.type, tone: tag.tone, remembered: Boolean(event.contextSummary), observer, ...(fallbackReason ? { fallbackReason } : {}) };
   } catch (error) {
-    log('interaction_classify_failed', { message: error.message });
-    return { error: 'model_request_failed' };
+    log('interaction_classify_apply_failed', { message: error.message });
+    return { error: 'observer_apply_failed', observer };
   }
 }
 
