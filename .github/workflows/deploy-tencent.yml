@@ -108,5 +108,12 @@ jobs:
           fi
           sudo docker compose up -d --build
           sudo docker compose ps
-          curl -fsS http://127.0.0.1:18110/health
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fsS http://127.0.0.1:18110/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+          sudo docker compose logs --tail 80 dynamic-mind
+          exit 1
           REMOTE
